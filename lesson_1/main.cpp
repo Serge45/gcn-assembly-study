@@ -1,10 +1,10 @@
+#include <cassert>
 #include <cstring>
 #include <iostream>
-#include <string>
-#include <cassert>
 #include <limits>
-#include <vector>
 #include <random>
+#include <string>
+#include <vector>
 #include <hip/hip_runtime.h>
 #include <hip/device_functions.h>
 #include <hip/hip_ext.h>
@@ -23,7 +23,7 @@ int main(int argc, char **argv) {
     hipFunction_t gpuFunc;
     err = hipModuleGetFunction(&gpuFunc, module, "vector_add");
     assert(err == HIP_SUCCESS);
-    std::uint32_t numElements = 64;
+    std::uint32_t numElements = 1000;
     float *a{};
     float *b{};
     float *c{};
@@ -67,7 +67,12 @@ int main(int argc, char **argv) {
         HIP_LAUNCH_PARAM_END
     };
 
-    err = hipExtModuleLaunchKernel(gpuFunc, numElements, 1, 1, numElements, 1, 1, 0, nullptr, nullptr, kernelArgs);
+    constexpr auto wavefrontSize = 64ull;
+    constexpr auto numWavesPerWorkgroup = 4ull;
+    constexpr auto workgroupSizes = wavefrontSize * numWavesPerWorkgroup;
+    const std::size_t numWorkgroups = (numElements / workgroupSizes) + !!(numElements % workgroupSizes);
+
+    err = hipExtModuleLaunchKernel(gpuFunc, numWorkgroups * workgroupSizes, 1, 1, workgroupSizes, 1, 1, 0, nullptr, nullptr, kernelArgs);
     err = hipDeviceSynchronize();
     std::vector<float> cpuC(numElements, 0.f);
     std::vector<float> ans(numElements, 0.f);
