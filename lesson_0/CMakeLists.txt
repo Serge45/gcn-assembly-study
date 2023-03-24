@@ -1,0 +1,7 @@
+cmake_minimum_required(VERSION 3.16)
+project(app)
+add_executable(${PROJECT_NAME} main.cpp)
+find_package(hip REQUIRED)
+target_link_libraries(app hip::device)
+include(../asm.cmake)
+build_asm(set)
