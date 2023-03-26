@@ -51,8 +51,8 @@ amdhsa.kernels:
    .private_segment_fixed_size: 0
    .kernarg_segment_align: 8
    .wavefront_size: 64
-   .sgpr_count: 20
-   .vgpr_count: 2
+   .sgpr_count: 16
+   .vgpr_count: 3
    .agpr_count: 0
    .max_flat_workgroup_size: 256
    .args:
