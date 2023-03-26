@@ -16,12 +16,14 @@ int main(int argc, char **argv) {
     hipDevice_t dev{};
     auto err = hipDeviceGet(&dev, 0);
     hipModule_t module;
-    assert(argc == 2);
-    std::string coPath(argv[1]);
+    assert(argc == 3);
+    const std::string coPath(argv[1]);
+    const bool useLeakyRelu = std::atoi(argv[2]);
     err = hipModuleLoad(&module, coPath.c_str());
     assert(err == HIP_SUCCESS);
+    const std::string kernelName = useLeakyRelu ? "leaky_relu" : "relu";
     hipFunction_t gpuFunc;
-    err = hipModuleGetFunction(&gpuFunc, module, "relu");
+    err = hipModuleGetFunction(&gpuFunc, module, kernelName.c_str());
     assert(err == HIP_SUCCESS);
     std::uint32_t numElements = 1000;
     float *a{};
@@ -37,11 +39,18 @@ int main(int argc, char **argv) {
     err = hipMemcpyHtoD(a, cpuA.data(), cpuA.size() * sizeof(float));
     err = hipMemset(b, 0, sizeof(float) * numElements);
     std::size_t argSize = sizeof(float *) * 2 + sizeof(numElements);
+    const float alpha = std::abs(dist(gen));
+
+    if (useLeakyRelu) {
+        argSize += sizeof(alpha);
+    }
+
     constexpr std::size_t alignment = 8;
 
     if (argSize % alignment) {
         argSize += alignment - (argSize % alignment);
     }
+
 
     std::vector<std::uint8_t> args(argSize, 0);
     std::size_t cursor{};
@@ -49,6 +58,12 @@ int main(int argc, char **argv) {
     cursor += sizeof(a);
     std::memcpy(args.data() + cursor, &b, sizeof(b));
     cursor += sizeof(b);
+
+    if (useLeakyRelu) {
+        std::memcpy(args.data() + cursor, &alpha, sizeof(alpha));
+        cursor += sizeof(alpha);
+    }
+
     std::memcpy(args.data() + cursor, &numElements, sizeof(numElements));
     cursor += sizeof(numElements);
 
@@ -70,8 +85,14 @@ int main(int argc, char **argv) {
     std::vector<float> cpuB(numElements, 0.f);
     std::vector<float> ans(numElements, 0.f);
 
-    for (std::size_t i = 0; i < numElements; ++i) {
-        ans[i] = std::max(cpuA[i], 0.f);
+    if (useLeakyRelu) {
+        for (std::size_t i = 0; i < numElements; ++i) {
+            ans[i] = cpuA[i] > 0.f ? cpuA[i] : cpuA[i] * alpha;
+        }
+    } else {
+        for (std::size_t i = 0; i < numElements; ++i) {
+            ans[i] = std::max(cpuA[i], 0.f);
+        }
     }
 
     err = hipMemcpyDtoH(cpuB.data(), b, sizeof(float) * numElements);
