@@ -11,6 +11,10 @@ class KernelArguments {
     using BufferType = std::vector<BufferElemType>;
 
 public:
+    void reserve(std::size_t numBytes) {
+        bytes.reserve(numBytes);
+    }
+
     template<typename T>
     void append(const T &arg) {
         constexpr auto numBytesRequired = sizeof(T);

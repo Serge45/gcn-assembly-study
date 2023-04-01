@@ -1,5 +1,6 @@
 #include <algorithm>
 #include <cassert>
+#include <chrono>
 #include <iostream>
 #include <limits>
 #include <string>
@@ -9,6 +10,81 @@
 #include <hip/hip_ext.h>
 #include "../Utils/KernelArguments.hpp"
 #include "../Utils/BufferUtils.hpp"
+
+constexpr std::uint32_t NUM_WORKITEM_PER_WORKGROUP = 256;
+
+hipError_t gpuMax(float *m, float *a, std::size_t numElements, hipFunction_t kernelFunc) {
+    float *gpuBuf{};
+    auto err = hipMalloc(&gpuBuf, sizeof(float) * numElements);
+    err = hipMemcpyHtoD(gpuBuf, a, sizeof(float) * numElements);
+    std::size_t workspaceSize = numElements / NUM_WORKITEM_PER_WORKGROUP;
+    float *workspace{};
+    err = hipMalloc(&workspace, sizeof(float) * workspaceSize);
+
+    hipEvent_t beg, end;
+    err = hipEventCreate(&beg);
+    err = hipEventCreate(&end);
+
+    err = hipEventRecord(beg);
+
+    KernelArguments kArgs;
+    kArgs.reserve(24);
+    kArgs.append(gpuBuf);
+    kArgs.append<std::uint32_t>(numElements);
+    kArgs.append(workspace);
+    kArgs.applyAlignment();
+    std::size_t argSize = kArgs.size();
+    void *kernelArgs[] = {
+        HIP_LAUNCH_PARAM_BUFFER_POINTER,
+        kArgs.buffer(),
+        HIP_LAUNCH_PARAM_BUFFER_SIZE,
+        &argSize,
+        HIP_LAUNCH_PARAM_END
+    };
+
+    err = hipExtModuleLaunchKernel(kernelFunc, numElements, 1, 1,
+        NUM_WORKITEM_PER_WORKGROUP, 1, 1,
+        sizeof(float) * NUM_WORKITEM_PER_WORKGROUP,
+        nullptr,
+        nullptr, kernelArgs);
+
+    numElements /= NUM_WORKITEM_PER_WORKGROUP;
+    err = hipDeviceSynchronize();
+
+    while (numElements > 1) {
+        KernelArguments kArgs;
+        kArgs.reserve(24);
+        kArgs.append(workspace);
+        kArgs.append<std::uint32_t>(numElements);
+        kArgs.append(workspace);
+        kArgs.applyAlignment();
+        std::size_t argSize = kArgs.size();
+        void *kernelArgs[] = {
+            HIP_LAUNCH_PARAM_BUFFER_POINTER,
+            kArgs.buffer(),
+            HIP_LAUNCH_PARAM_BUFFER_SIZE,
+            &argSize,
+            HIP_LAUNCH_PARAM_END
+        };
+        err = hipExtModuleLaunchKernel(kernelFunc, numElements, 1, 1,
+            NUM_WORKITEM_PER_WORKGROUP, 1, 1,
+            sizeof(float) * NUM_WORKITEM_PER_WORKGROUP,
+            nullptr,
+            nullptr, kernelArgs);
+        numElements /= NUM_WORKITEM_PER_WORKGROUP;
+        err = hipDeviceSynchronize();
+    }
+    err = hipEventRecord(end);
+    float dur{};
+    err = hipEventElapsedTime(&dur, beg, end);
+    std::cout << "GPU Max func: " << std::to_string(dur) << " ms\n";
+    err = hipEventDestroy(beg);
+    err = hipEventDestroy(end);
+    err = hipMemcpyDtoH(m, workspace, sizeof(float));
+    err = hipFree(gpuBuf);
+    err = hipFree(workspace);
+    return err;
+}
 
 int main(int argc, char **argv) {
     hipDevice_t dev{};
@@ -23,34 +99,21 @@ int main(int argc, char **argv) {
     err = hipModuleGetFunction(&gpuFunc, module, "max_func");
     assert(err == HIP_SUCCESS);
     float *gpuMem{};
-    float *maxMem{};
     std::vector<float> cpuMem(numElements, 0);
     randomize(begin(cpuMem), end(cpuMem));
     err = hipMalloc(&gpuMem, sizeof(float) * numElements);
-    err = hipMalloc(&maxMem, sizeof(float));
     err = hipMemcpyHtoD(gpuMem, cpuMem.data(), cpuMem.size() * sizeof(float));
-    KernelArguments kArgs;
-    kArgs.append(gpuMem);
-    kArgs.append(numElements);
-    kArgs.append(maxMem);
-    kArgs.applyAlignment();
-    std::size_t argSize = kArgs.size();
 
-    void *kernelArgs[] = {
-        HIP_LAUNCH_PARAM_BUFFER_POINTER,
-        reinterpret_cast<void *>(kArgs.buffer()),
-        HIP_LAUNCH_PARAM_BUFFER_SIZE,
-        reinterpret_cast<void *>(&argSize),
-        HIP_LAUNCH_PARAM_END};
-
-    err = hipExtModuleLaunchKernel(gpuFunc, 256, 1, 1, 256, 1, 1, 256 * sizeof(float), nullptr, nullptr, kernelArgs);
-    err = hipDeviceSynchronize();
     float gpuResult{};
-    err = hipMemcpyDtoH(&gpuResult, maxMem, sizeof(float));
+    err = gpuMax(&gpuResult, cpuMem.data(), numElements, gpuFunc);
+    auto cpuBeg = std::chrono::steady_clock::now();
     auto cpuMax = *std::max_element(begin(cpuMem), end(cpuMem));
+    auto cpuEnd = std::chrono::steady_clock::now();
+    std::cout << "CPU Max func: " << std::chrono::duration<float, std::milli>(cpuEnd - cpuBeg).count() << " ms\n";
+
     assert(cpuMax == gpuResult);
+    std::cout << "Check: " << int(cpuMax == gpuResult) << '\n';
     err = hipFree(gpuMem);
-    err = hipFree(maxMem);
     err = hipModuleUnload(module);
     return 0;
 }

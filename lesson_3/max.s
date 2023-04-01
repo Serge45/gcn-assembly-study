@@ -14,8 +14,10 @@ max_func:
   .set sgprNumReduces, 9
   .set sgprReduceMask, 10
   .set sgprReduceIter, 11
+  .set sgprOutputWorkgroupOffset, 12
   .set srdConst, 0x20000
-  .set log2WavefrontSize, 6
+  .set workgroupSize, 256
+  .set log2WorkgroupSize, 8
   .set log2ElemWidthByte, 2
   .set elemWidthByte, 4
   .set inputOffset, 0x0
@@ -32,11 +34,12 @@ max_func:
   s_load_dwordx2 s[sgprSrdInput:sgprSrdInput+1], s[sgprKernelArg:sgprKernelArg+1] inputOffset
   s_load_dword s[sgprNumElemInBytes], s[sgprKernelArg:sgprKernelArg+1] inputSizeOffset
   s_waitcnt lgkmcnt(0)
-  s_mov_b32 s[sgprNumReduces], s[sgprNumElemInBytes]
+  s_mov_b32 s[sgprNumReduces], workgroupSize
   s_lshl_b32 s[sgprNumElemInBytes], s[sgprNumElemInBytes], log2ElemWidthByte
   s_mov_b32 s[sgprSrdInput+2], s[sgprNumElemInBytes]
   s_mov_b32 s[sgprSrdInput+3], srdConst
-  s_lshl_b32 s[sgprWorkgroupOffset], s[sgprWorkgroupId], log2WavefrontSize
+  s_lshl_b32 s[sgprOutputWorkgroupOffset], s[sgprWorkgroupId], log2ElemWidthByte
+  s_lshl_b32 s[sgprWorkgroupOffset], s[sgprWorkgroupId], log2WorkgroupSize
   v_add_lshl_u32 v[vgprElemOffsetByte], v[vgprTid], s[sgprWorkgroupOffset], log2ElemWidthByte
   buffer_load_dword v[vgprElem], v[vgprElemOffsetByte], s[sgprSrdInput:sgprSrdInput+3], 0 offen offset:0
   s_waitcnt vmcnt(0)
@@ -66,8 +69,8 @@ max_func:
     s_branch label_reduce
   label_reduceend:
     s_load_dwordx2 s[sgprSrdOutput:sgprSrdOutput+1], s[sgprKernelArg:sgprKernelArg+1] outputOffset
-    s_mov_b32 s[sgprSrdOutput+2], elemWidthByte
     s_waitcnt lgkmcnt(0)
+    s_add_u32 s[sgprSrdOutput], s[sgprSrdOutput], s[sgprOutputWorkgroupOffset]
     buffer_store_dword v[vgprMaxElem], v[vgprTid], s[sgprSrdOutput:sgprSrdOutput+3], 0 offen offset:0
   s_endpgm
 .Lmax_func_end0:
@@ -97,7 +100,7 @@ amdhsa.kernels:
    .private_segment_fixed_size: 0
    .kernarg_segment_align: 8
    .wavefront_size: 64
-   .sgpr_count: 12
+   .sgpr_count: 13
    .vgpr_count: 16
    .agpr_count: 0
    .max_flat_workgroup_size: 256
