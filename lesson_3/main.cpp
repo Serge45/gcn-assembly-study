@@ -9,9 +9,62 @@
 #include <hip/device_functions.h>
 #include <hip/hip_ext.h>
 #include "../Utils/KernelArguments.hpp"
+#include "../Utils/Math.hpp"
 #include "../Utils/BufferUtils.hpp"
 
 constexpr std::uint32_t NUM_WORKITEM_PER_WORKGROUP = 256;
+
+template<typename DType>
+__global__ __launch_bounds__(NUM_WORKITEM_PER_WORKGROUP, 4) void hipGpuMaxKernel(DType *m, const DType *a, std::uint32_t numElements) {
+    __shared__ DType localBuf[NUM_WORKITEM_PER_WORKGROUP];
+    const auto tId = threadIdx.x;
+    const auto readOffset = (blockIdx.x * blockDim.x + tId);
+    const auto writeOffset = blockIdx.x;
+    localBuf[tId] = a[readOffset];
+    std::uint32_t i = 0;
+
+    while ((1 << i) < NUM_WORKITEM_PER_WORKGROUP) {
+        __syncthreads();
+        if ((tId & ((1 << (i + 1)) - 1)) == 0) {
+            localBuf[tId] = std::max(localBuf[tId], localBuf[tId + (1 << i)]);
+        }
+        ++i;
+    }
+
+    if (tId == 0) {
+        m[writeOffset] = localBuf[0];
+    }
+}
+
+template<typename DType>
+hipError_t hipGpuMax(DType *m, DType *a, std::uint32_t numElements) {
+    DType *gpuBuf{};
+    DType *gpuM{};
+    auto err = hipMalloc(&gpuBuf, sizeof(DType) * numElements);
+    err = hipMemcpyHtoD(gpuBuf, a, sizeof(DType) * numElements);
+    err = hipMalloc(&gpuM, sizeof(DType) * (numElements / NUM_WORKITEM_PER_WORKGROUP));
+    hipEvent_t beg, end;
+    err = hipEventCreate(&beg);
+    err = hipEventCreate(&end);
+    err = hipEventRecord(beg);
+    hipGpuMaxKernel<DType><<<numElements / NUM_WORKITEM_PER_WORKGROUP, NUM_WORKITEM_PER_WORKGROUP>>>(gpuM, gpuBuf, numElements);
+    numElements /= NUM_WORKITEM_PER_WORKGROUP;
+    err = hipDeviceSynchronize();
+
+    while (numElements > 1) {
+        hipGpuMaxKernel<DType><<<numElements / NUM_WORKITEM_PER_WORKGROUP, NUM_WORKITEM_PER_WORKGROUP>>>(gpuM, gpuM, numElements);
+        err = hipDeviceSynchronize();
+        numElements /= NUM_WORKITEM_PER_WORKGROUP;
+    }
+    err = hipEventRecord(end);
+    float dur{};
+    err = hipEventElapsedTime(&dur, beg, end);
+    std::cout << "HIP func: " << std::to_string(dur) << " ms\n";
+    err = hipMemcpyDtoH(m, gpuM, sizeof(DType));
+    err = hipFree(gpuBuf);
+    err = hipFree(gpuM);
+    return err;
+}
 
 hipError_t gpuMax(float *m, float *a, std::size_t numElements, hipFunction_t kernelFunc) {
     float *gpuBuf{};
@@ -106,13 +159,16 @@ int main(int argc, char **argv) {
 
     float gpuResult{};
     err = gpuMax(&gpuResult, cpuMem.data(), numElements, gpuFunc);
+    float hipResult{};
+    err = hipGpuMax(&hipResult, cpuMem.data(), numElements);
     auto cpuBeg = std::chrono::steady_clock::now();
     auto cpuMax = *std::max_element(begin(cpuMem), end(cpuMem));
     auto cpuEnd = std::chrono::steady_clock::now();
     std::cout << "CPU Max func: " << std::chrono::duration<float, std::milli>(cpuEnd - cpuBeg).count() << " ms\n";
 
     assert(cpuMax == gpuResult);
-    std::cout << "Check: " << int(cpuMax == gpuResult) << '\n';
+    std::cout << "Check ASM vs CPU: " << almostEqual(cpuMax, gpuResult) << '\n';
+    std::cout << "Check HIP vs CPU: " << almostEqual(cpuMax, hipResult) << '\n';
     err = hipFree(gpuMem);
     err = hipModuleUnload(module);
     return 0;
