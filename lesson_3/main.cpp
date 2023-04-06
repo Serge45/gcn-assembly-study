@@ -23,12 +23,11 @@ __global__ __launch_bounds__(NUM_WORKITEM_PER_WORKGROUP, 4) void hipGpuMaxKernel
     localBuf[tId] = a[readOffset];
     std::uint32_t i = 0;
 
-    while ((1 << i) < NUM_WORKITEM_PER_WORKGROUP) {
-        __syncthreads();
-        if ((tId & ((1 << (i + 1)) - 1)) == 0) {
-            localBuf[tId] = std::max(localBuf[tId], localBuf[tId + (1 << i)]);
+    for (std::uint32_t s = (blockDim.x >> 1); s > 0; s >>= 1) {
+        if (tId < s) {
+            localBuf[tId] = std::max(localBuf[tId], localBuf[tId + s]);
         }
-        ++i;
+        __syncthreads();
     }
 
     if (tId == 0) {
@@ -53,10 +52,12 @@ hipError_t hipGpuMax(DType *m, DType *a, std::uint32_t numElements) {
 
     while (numElements > 1) {
         hipGpuMaxKernel<DType><<<numElements / NUM_WORKITEM_PER_WORKGROUP, NUM_WORKITEM_PER_WORKGROUP>>>(gpuM, gpuM, numElements);
-        err = hipDeviceSynchronize();
         numElements /= NUM_WORKITEM_PER_WORKGROUP;
+        if (numElements == 1) {
+            err = hipEventRecord(end);
+        }
+        err = hipDeviceSynchronize();
     }
-    err = hipEventRecord(end);
     float dur{};
     err = hipEventElapsedTime(&dur, beg, end);
     std::cout << "HIP func: " << std::to_string(dur) << " ms\n";
@@ -125,12 +126,16 @@ hipError_t gpuMax(float *m, float *a, std::size_t numElements, hipFunction_t ker
             nullptr,
             nullptr, kernelArgs);
         numElements /= NUM_WORKITEM_PER_WORKGROUP;
+
+        if (numElements == 1) {
+            err = hipEventRecord(end);
+        }
         err = hipDeviceSynchronize();
     }
-    err = hipEventRecord(end);
     float dur{};
     err = hipEventElapsedTime(&dur, beg, end);
-    std::cout << "GPU Max func: " << std::to_string(dur) << " ms\n";
+    const auto gpuBandWidth = (2 * numElements * sizeof(float) / std::pow(1024.f, 3)) * 1e3 / (dur);
+    std::cout << "GPU Max func: " << std::to_string(dur) << " ms, " << std::to_string(gpuBandWidth) << " GB/s\n";
     err = hipEventDestroy(beg);
     err = hipEventDestroy(end);
     err = hipMemcpyDtoH(m, workspace, sizeof(float));
@@ -158,13 +163,24 @@ int main(int argc, char **argv) {
     err = hipMemcpyHtoD(gpuMem, cpuMem.data(), cpuMem.size() * sizeof(float));
 
     float gpuResult{};
-    err = gpuMax(&gpuResult, cpuMem.data(), numElements, gpuFunc);
+
+    for (std::size_t i = 0; i < 10; ++i) {
+        err = gpuMax(&gpuResult, cpuMem.data(), numElements, gpuFunc);
+    }
+
     float hipResult{};
-    err = hipGpuMax(&hipResult, cpuMem.data(), numElements);
+
+    for (std::size_t i = 0; i < 10; ++i) {
+        err = hipGpuMax(&hipResult, cpuMem.data(), numElements);
+    }
+
     auto cpuBeg = std::chrono::steady_clock::now();
-    auto cpuMax = *std::max_element(begin(cpuMem), end(cpuMem));
+    float cpuMax{};
+    for (std::size_t i = 0; i < 10; ++i) {
+        cpuMax = *std::max_element(begin(cpuMem), end(cpuMem));
+    }
     auto cpuEnd = std::chrono::steady_clock::now();
-    std::cout << "CPU Max func: " << std::chrono::duration<float, std::milli>(cpuEnd - cpuBeg).count() << " ms\n";
+    std::cout << "CPU Max func: " << std::chrono::duration<float, std::milli>(cpuEnd - cpuBeg).count() / 10 << " ms\n";
 
     assert(cpuMax == gpuResult);
     std::cout << "Check ASM vs CPU: " << almostEqual(cpuMax, gpuResult) << '\n';

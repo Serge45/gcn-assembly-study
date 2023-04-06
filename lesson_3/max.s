@@ -29,12 +29,11 @@ max_func:
   .set vgprMaxElem, 3
   .set vgprDSWriteOffsetByte, 4
   .set vgprReduceTemp, 5
-  .set vgprTidRem, 7
+  .set vgprReduceIndex, 7
   .set vgprReduceByteOffset, 8
   s_load_dwordx2 s[sgprSrdInput:sgprSrdInput+1], s[sgprKernelArg:sgprKernelArg+1] inputOffset
   s_load_dword s[sgprNumElemInBytes], s[sgprKernelArg:sgprKernelArg+1] inputSizeOffset
   s_waitcnt lgkmcnt(0)
-  s_mov_b32 s[sgprNumReduces], workgroupSize
   s_lshl_b32 s[sgprNumElemInBytes], s[sgprNumElemInBytes], log2ElemWidthByte
   s_mov_b32 s[sgprSrdInput+2], s[sgprNumElemInBytes]
   s_mov_b32 s[sgprSrdInput+3], srdConst
@@ -42,22 +41,23 @@ max_func:
   s_lshl_b32 s[sgprWorkgroupOffset], s[sgprWorkgroupId], log2WorkgroupSize
   v_add_lshl_u32 v[vgprElemOffsetByte], v[vgprTid], s[sgprWorkgroupOffset], log2ElemWidthByte
   buffer_load_dword v[vgprElem], v[vgprElemOffsetByte], s[sgprSrdInput:sgprSrdInput+3], 0 offen offset:0
-  s_waitcnt vmcnt(0)
-  v_lshlrev_b32 v[vgprDSWriteOffsetByte], log2ElemWidthByte, v[vgprTid]
-  ds_write_b32 v[vgprDSWriteOffsetByte], v[vgprElem]
   s_mov_b32 s[sgprReduceIter], 0
+  s_load_dwordx2 s[sgprSrdOutput:sgprSrdOutput+1], s[sgprKernelArg:sgprKernelArg+1] outputOffset
+  v_lshlrev_b32 v[vgprDSWriteOffsetByte], log2ElemWidthByte, v[vgprTid]
+  s_waitcnt vmcnt(0)
+  ds_write_b32 v[vgprDSWriteOffsetByte], v[vgprElem]
   s_waitcnt lgkmcnt(0)
   s_barrier
+
   label_reduce:
     s_lshl_b32 s[sgprReduceStep], 1, s[sgprReduceIter]
-    s_cmp_lt_u32 s[sgprReduceStep], s[sgprNumReduces]
+    s_cmp_lt_u32 s[sgprReduceStep], workgroupSize
     s_cbranch_scc0 label_reduceend
-    s_lshl_b32 s[sgprReduceMask], s[sgprReduceStep], 1
-    s_sub_i32 s[sgprReduceMask], s[sgprReduceMask], 1
-    v_and_b32 v[vgprTidRem], v[vgprTid], s[sgprReduceMask]
-    v_cmpx_eq_i32 vcc, 0, v[vgprTidRem]
-    v_lshlrev_b32 v[vgprReduceByteOffset], log2ElemWidthByte, v[vgprTid]
-    v_add_lshl_u32 v[vgprReduceByteOffset+1], v[vgprTid], s[sgprReduceStep], log2ElemWidthByte
+    v_mul_u32_u24 v[vgprReduceIndex], v[vgprTid], s[sgprReduceStep]
+    v_lshlrev_b32 v[vgprReduceIndex], 1, v[vgprReduceIndex]
+    v_cmpx_gt_i32 vcc, workgroupSize, v[vgprReduceIndex]
+    v_lshlrev_b32 v[vgprReduceByteOffset], log2ElemWidthByte, v[vgprReduceIndex]
+    v_add_lshl_u32 v[vgprReduceByteOffset+1], v[vgprReduceIndex], s[sgprReduceStep], log2ElemWidthByte
     ds_read_b32 v[vgprReduceTemp], v[vgprReduceByteOffset]
     ds_read_b32 v[vgprReduceTemp+1], v[vgprReduceByteOffset+1]
     s_waitcnt lgkmcnt(0)
@@ -67,11 +67,10 @@ max_func:
     s_waitcnt lgkmcnt(0)
     s_barrier
     s_branch label_reduce
+    
   label_reduceend:
-    s_load_dwordx2 s[sgprSrdOutput:sgprSrdOutput+1], s[sgprKernelArg:sgprKernelArg+1] outputOffset
     s_waitcnt lgkmcnt(0)
-    s_add_u32 s[sgprSrdOutput], s[sgprSrdOutput], s[sgprOutputWorkgroupOffset]
-    buffer_store_dword v[vgprMaxElem], v[vgprTid], s[sgprSrdOutput:sgprSrdOutput+3], 0 offen offset:0
+    buffer_store_dword v[vgprMaxElem], v[vgprTid], s[sgprSrdOutput:sgprSrdOutput+3], s[sgprOutputWorkgroupOffset] offen offset:0
   s_endpgm
 .Lmax_func_end0:
   .size max_func, .Lmax_func_end0 - max_func
