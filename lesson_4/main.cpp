@@ -92,23 +92,17 @@ void hipGpuSoftmax(DType *m, DType *a, std::uint32_t numRows) {
 template<typename DType, std::uint32_t Cols>
 void cpuSoftmax(DType *m, DType *a, std::uint32_t numRows) {
     for (std::uint32_t i = 0; i < numRows; ++i) {
-        auto rowMax = a[i * Cols];
-
-        for (std::uint32_t j = 1; j < Cols; ++j) {
-            rowMax = std::max(a[i * Cols + j], rowMax);
-        }
-
+        const auto rowMax = *std::max_element(a + i * Cols, a + i * Cols + Cols);
         auto rowSum = 0.f;
+        std::transform(a + i * Cols, a + i * Cols + Cols, m + i * Cols, [&rowSum] (auto v) {
+            const auto u = std::exp(v);
+            rowSum += u;
+            return u;
+        });
 
-        for (std::uint32_t j = 0; j < Cols; ++j) {
-            const auto v = std::exp(a[i * Cols + j] - rowMax);
-            m[i * Cols + j] = v;
-            rowSum += v;
-        }
-
-        for (std::uint32_t j = 0; j < Cols; ++j) {
-            m[i * Cols + j] /= rowSum;
-        }
+        std::transform(m + i * Cols, m + i * Cols + Cols, m + i * Cols, [rowSum] (auto v) {
+            return v / rowSum;
+        });
     }
 }
 
