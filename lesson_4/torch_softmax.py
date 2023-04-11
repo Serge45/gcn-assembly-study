@@ -10,7 +10,7 @@ s = nn.Softmax(dim=-1)
 i = torch.randn(m, n, dtype=torch.float, device=d, requires_grad=False)
 o = torch.zeros(m, n, dtype=torch.float, device=d, requires_grad=False)
 
-for _ in range(100):
+for _ in range(300):
     o = s(i)
 
 print(o)
