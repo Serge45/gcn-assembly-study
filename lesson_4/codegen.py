@@ -65,6 +65,7 @@ class SoftmaxKernelGenerator:
         self.func_name = 'softmax_func'
         self.strides = strides
         self.t_id_reg_idx = 0 #TODO: support config on this
+        self.numerically_stable = True
         self.debug_label = True
 
     def local_write_inst_type(self, num_elements: int):
@@ -122,7 +123,7 @@ class SoftmaxKernelGenerator:
     def bpe(self) -> int:
         return self.io_type.numBytes()
 
-    def load_kernel_args(self, sync: bool):
+    def load_kernel_args(self):
         kernel_args_addr = 0
         kernel_args_addr_size = 2
         input_srd_idx = self.sgpr_pool.checkOutAligned(self.srd_num_reg, self.srd_alignment)
@@ -132,13 +133,14 @@ class SoftmaxKernelGenerator:
         num_elem_reg_idx = self.sgpr_pool.checkOut(1)
         module = ti.Module('Load kernel args')
         module.add(ti.SLoadB64(ti.sgpr(input_srd_idx, 2), ti.sgpr(kernel_args_addr, kernel_args_addr_size), 0))
-        module.add(ti.SLoadB64(ti.sgpr(output_srd_idx, 2), ti.sgpr(kernel_args_addr, kernel_args_addr_size), 8))
         module.add(ti.SLoadB32(ti.sgpr(m_reg_idx), ti.sgpr(kernel_args_addr, kernel_args_addr_size), 16))
         module.add(ti.SLoadB32(ti.sgpr(n_reg_idx), ti.sgpr(kernel_args_addr, kernel_args_addr_size), 20))
         module.add(ti.SWaitCnt(lgkmcnt=0))
+        module.add(ti.SLoadB64(ti.sgpr(output_srd_idx, 2), ti.sgpr(kernel_args_addr, kernel_args_addr_size), 8))
         module.add(ti.SMulI32(ti.sgpr(num_elem_reg_idx), ti.sgpr(m_reg_idx), ti.sgpr(n_reg_idx)))
         module.add(ti.SMulI32(ti.sgpr(num_elem_reg_idx), ti.sgpr(num_elem_reg_idx), hex(self.bpe)))
         module.add(ti.SMovB32(ti.sgpr(input_srd_idx + 2), ti.sgpr(num_elem_reg_idx)))
+        module.add(ti.SWaitCnt(lgkmcnt=0))
         module.add(ti.SMovB32(ti.sgpr(output_srd_idx + 2), ti.sgpr(num_elem_reg_idx)))
         module.add(ti.SMovB32(ti.sgpr(input_srd_idx + 3), self.srd_const))
         module.add(ti.SMovB32(ti.sgpr(output_srd_idx + 3), self.srd_const))
@@ -160,7 +162,7 @@ class SoftmaxKernelGenerator:
         return module, byte_offset_reg_idx
 
     @record_num_calls
-    def global_read(self, srd_reg_idx: int, soffset_reg_idx: int, sync: bool):
+    def global_read(self, srd_reg_idx: int, soffset_reg_idx: int, ext_local_read_byte_offset_reg_idx: Optional[int], sync: bool):
         '''
         col_idx = t_id % num_cols
         row_idx = t_id / num_cols
@@ -173,30 +175,42 @@ class SoftmaxKernelGenerator:
         if self.debug_label:
             module.add(ti.Label(f'global_read_{self.global_read.num_calls()}', 'global read begins'))
 
-        local_offset_mod, byte_offset_reg_idx = self.local_offset()
-        module.add(local_offset_mod)
+        if ext_local_read_byte_offset_reg_idx:
+            local_offset_mod, byte_offset_reg_idx = self.local_offset()
+            module.add(local_offset_mod)
+        else:
+            byte_offset_reg_idx = ext_local_read_byte_offset_reg_idx
+
         num_elem_read = 1
         BufferLoadType = self.global_read_inst_type(num_elem_read)
         data_reg_idx = self.vgpr_pool.checkOut(1)
         module.add(BufferLoadType(ti.vgpr(data_reg_idx), ti.vgpr(byte_offset_reg_idx), ti.sgpr(srd_reg_idx, self.srd_num_reg), ti.sgpr(soffset_reg_idx), ti.MUBUFModifiers(True)))
-        self.vgpr_pool.checkIn(byte_offset_reg_idx)
+
+        if ext_local_read_byte_offset_reg_idx:
+            self.vgpr_pool.checkIn(byte_offset_reg_idx)
 
         if sync:
             module.add(ti.SWaitCnt(vmcnt=0))
 
         return module, data_reg_idx
         
-    def local_read(self, sync: bool = True):
+    def local_read(self, ext_local_byte_offset_reg_idx: Optional[int] = None, sync: bool = True):
         module = ti.Module()
-        local_offset_mod, local_byte_offset_reg_idx = self.local_offset()
-        module.add(local_offset_mod)
+
+        if not ext_local_byte_offset_reg_idx:
+            local_offset_mod, local_byte_offset_reg_idx = self.local_offset()
+            module.add(local_offset_mod)
+        else:
+            local_byte_offset_reg_idx = ext_local_byte_offset_reg_idx
+
         data_reg_idx = self.vgpr_pool.checkOut(1)
         module.add(ti.DSLoadB32(ti.vgpr(data_reg_idx), ti.vgpr(local_byte_offset_reg_idx), False))
 
         if sync:
             module.add(ti.SWaitCnt(lgkmcnt=0))
 
-        self.vgpr_pool.checkIn(local_byte_offset_reg_idx)
+        if not ext_local_byte_offset_reg_idx:
+            self.vgpr_pool.checkIn(local_byte_offset_reg_idx)
 
         return module, data_reg_idx
 
@@ -215,17 +229,23 @@ class SoftmaxKernelGenerator:
         return mod, wg_byte_offset_reg_idx
 
     @record_num_calls
-    def local_write(self, data_reg_idx: int, num_elem: int, sync: bool):
+    def local_write(self, data_reg_idx: int, num_elem: int, ext_local_read_byte_offset_reg_idx: Optional[int], sync: bool):
         module = ti.Module()
 
         if self.debug_label:
             module.add(ti.Label(f'local_write_{self.local_write.num_calls()}', 'local write begins'))
 
-        local_offset_mod, byte_offset_reg_idx = self.local_offset()
-        module.add(local_offset_mod)
+        if not ext_local_read_byte_offset_reg_idx:
+            local_offset_mod, byte_offset_reg_idx = self.local_offset()
+            module.add(local_offset_mod)
+        else:
+            byte_offset_reg_idx = ext_local_read_byte_offset_reg_idx
+
         LocalWriteType = self.local_write_inst_type(num_elem)
         module.add(LocalWriteType(ti.vgpr(byte_offset_reg_idx), ti.vgpr(data_reg_idx)))
-        self.vgpr_pool.checkIn(byte_offset_reg_idx)
+
+        if not ext_local_read_byte_offset_reg_idx:
+            self.vgpr_pool.checkIn(byte_offset_reg_idx)
 
         if sync:
             module.add(ti.SWaitCnt(lgkmcnt=0))
@@ -405,7 +425,7 @@ class SoftmaxKernelGenerator:
         self.vgpr_pool.checkIn(local_byte_offset_reg_idx)
         return module
 
-    def global_write_data(self, data_reg_idx: int, srd_reg_idx: int, sync: bool):
+    def global_write_data(self, data_reg_idx: int, srd_reg_idx: int, ext_local_read_byte_offset: Optional[int], sync: bool):
         module = ti.Module()
 
         if self.debug_label:
@@ -413,9 +433,14 @@ class SoftmaxKernelGenerator:
 
         wg_offset_mod, wg_byte_offset_reg_idx = self.setup_global_read_wg_offset()
         module.add(wg_offset_mod)
-        local_read_mod, local_read_data_reg_idx = self.local_read()
-        local_offset_mod, local_byte_offset_reg_idx = self.local_offset()
-        module.add(local_offset_mod)
+        #local_read_mod, local_read_data_reg_idx = self.local_read(ext_local_read_byte_offset)
+
+        if not ext_local_read_byte_offset:
+            local_offset_mod, local_byte_offset_reg_idx = self.local_offset()
+            module.add(local_offset_mod)
+        else:
+            local_byte_offset_reg_idx = ext_local_read_byte_offset
+
         GlobalWriteInstType = self.global_write_inst_type(1)
         module.add(GlobalWriteInstType(ti.vgpr(data_reg_idx), ti.vgpr(local_byte_offset_reg_idx), ti.sgpr(srd_reg_idx, self.srd_num_reg), ti.sgpr(wg_byte_offset_reg_idx), ti.MUBUFModifiers(offen=True)))
 
@@ -423,8 +448,9 @@ class SoftmaxKernelGenerator:
             module.add(ti.SWaitCnt(vmcnt=0))
 
         self.sgpr_pool.checkIn(wg_byte_offset_reg_idx)
-        self.vgpr_pool.checkIn(local_read_data_reg_idx)
-        self.vgpr_pool.checkIn(local_byte_offset_reg_idx)
+        #self.vgpr_pool.checkIn(local_read_data_reg_idx)
+        if not ext_local_read_byte_offset:
+            self.vgpr_pool.checkIn(local_byte_offset_reg_idx)
         return module
 
     def kernel_args(self):
@@ -436,27 +462,31 @@ class SoftmaxKernelGenerator:
     def softmax_kernel_body(self):
         mod = ti.Module(self.func_name)
         with asm_func(self.func_name, mod):
-            kernel_args_load_mod, input_srd, output_srd, m_reg_idx, n_reg_idx = self.load_kernel_args(True)
+            kernel_args_load_mod, input_srd, output_srd, m_reg_idx, n_reg_idx = self.load_kernel_args()
             mod.add(kernel_args_load_mod)
             wg_offset_mod, wg_offset_reg_idx = self.setup_global_read_wg_offset()
             mod.add(wg_offset_mod)
-            gl_mod, data_reg_idx = self.global_read(input_srd, wg_offset_reg_idx, True)
+            local_offset_mod, local_offset_byte_offset_reg_idx = self.local_offset()
+            mod.add(local_offset_mod)
+            gl_mod, data_reg_idx = self.global_read(input_srd, wg_offset_reg_idx, local_offset_byte_offset_reg_idx, True)
             mod.add(gl_mod)
-            mod.add(self.local_write(data_reg_idx, 1, True))
-            mod.add(self.reduction_max())
-            max_addr_mod, max_reg_idx = self.max_elem()
-            mod.add(max_addr_mod)
-            mod.add(self.sub_max(data_reg_idx, max_reg_idx))
-            self.vgpr_pool.checkIn(max_reg_idx)
+            mod.add(self.local_write(data_reg_idx, 1, local_offset_byte_offset_reg_idx, True))
+
+            if self.numerically_stable:
+                mod.add(self.reduction_max())
+                max_addr_mod, max_reg_idx = self.max_elem()
+                mod.add(max_addr_mod)
+                mod.add(self.sub_max(data_reg_idx, max_reg_idx))
+                self.vgpr_pool.checkIn(max_reg_idx)
+
             mod.add(self.exp(data_reg_idx))
-            mod.add(self.local_write(data_reg_idx, 1, True))
+            mod.add(self.local_write(data_reg_idx, 1, local_offset_byte_offset_reg_idx, True))
             mod.add(self.reduction_sum())
             sum_elem_mod, sum_reg_idx = self.sum_elem()
             mod.add(sum_elem_mod)
             mod.add(self.div_sum(data_reg_idx, sum_reg_idx))
             self.vgpr_pool.checkIn(sum_reg_idx)
-            #gw_mod = self.global_write(output_srd, True)
-            gw_mod = self.global_write_data(data_reg_idx, output_srd, True)
+            gw_mod = self.global_write_data(data_reg_idx, output_srd, local_offset_byte_offset_reg_idx, True)
             mod.add(gw_mod)
             mod.add(ti.SEndpgm())
             self.sgpr_pool.checkIn(input_srd)
@@ -465,6 +495,7 @@ class SoftmaxKernelGenerator:
             self.sgpr_pool.checkIn(m_reg_idx)
             self.sgpr_pool.checkIn(n_reg_idx)
             self.vgpr_pool.checkIn(data_reg_idx)
+            self.vgpr_pool.checkIn(local_offset_byte_offset_reg_idx)
         return mod
 
 def kernel_rodata(name: str):
