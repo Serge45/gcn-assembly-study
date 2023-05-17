@@ -9,3 +9,12 @@ function(build_asm f custom_target)
     VERBATIM
   )
 endfunction()
+
+function(gen_and_build_asm f custom_target)
+  add_custom_command(
+    TARGET ${custom_target}
+    PRE_BUILD
+    COMMAND python ${CMAKE_CURRENT_SOURCE_DIR}/codegen.py -o ${CMAKE_CURRENT_BINARY_DIR}/${f}.s
+    VERBATIM
+  )
+endfunction()

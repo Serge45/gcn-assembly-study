@@ -1,3 +1,7 @@
+#include <hip/hip_runtime.h>
+#include <hip/device_functions.h>
+#include <hip/hip_ext.h>
+#include <hip/math_functions.h>
 #include <algorithm>
 #include <cassert>
 #include <chrono>
@@ -5,10 +9,6 @@
 #include <limits>
 #include <string>
 #include <numeric>
-#include <hip/hip_runtime.h>
-#include <hip/device_functions.h>
-#include <hip/hip_ext.h>
-#include <hip/math_functions.h>
 #include "../Utils/KernelArguments.hpp"
 #include "../Utils/Math.hpp"
 #include "../Utils/BufferUtils.hpp"
@@ -137,8 +137,8 @@ void cpuSoftmax(DType *m, DType *a, std::uint32_t numRows) {
     for (std::uint32_t i = 0; i < numRows; ++i) {
         const auto rowMax = *std::max_element(a + i * Cols, a + i * Cols + Cols);
         auto rowSum = 0.f;
-        std::transform(a + i * Cols, a + i * Cols + Cols, m + i * Cols, [&rowSum] (auto v) {
-            const auto u = std::exp(v);
+        std::transform(a + i * Cols, a + i * Cols + Cols, m + i * Cols, [&rowSum, rowMax] (auto v) {
+            const auto u = std::exp(v - rowMax);
             rowSum += u;
             return u;
         });
@@ -163,10 +163,49 @@ void luanchGPUKernel(DType *dst, DType *src, std::uint32_t nRows) {
     }
 }
 
+hipError_t launchASMSoftmax(hipFunction_t func, float *src, float *dst, std::uint32_t m, std::uint32_t n, bool sync = true) {
+    KernelArguments args;
+    args.append(src);
+    args.append(dst);
+    args.append(m);
+    args.append(n);
+    args.applyAlignment();
+    std::size_t argsSize = args.size();
+    void *launchArgs[] = {
+        HIP_LAUNCH_PARAM_BUFFER_POINTER,
+        args.buffer(),
+        HIP_LAUNCH_PARAM_BUFFER_SIZE,
+        &argsSize,
+        HIP_LAUNCH_PARAM_END
+    };
+
+    hipEvent_t beg, end;
+    auto err = hipEventCreate(&beg);
+    err = hipEventCreate(&end);
+
+    err = hipEventRecord(beg);
+    err = hipExtModuleLaunchKernel(func, 256, 1, 1, 256, 1, 1, 256 * 4, nullptr, nullptr, launchArgs, beg, end);
+    err = hipEventRecord(end);
+
+    if (sync) {
+        err = hipDeviceSynchronize();
+    }
+
+    float dur{};
+    err = hipEventElapsedTime(&dur, beg, end);
+    std::cout << "ASM kernel time: " << std::to_string(dur) << " ms\n";
+    return err;
+}
+
+hipError_t prepareASMKernel(const std::string &funcName, const std::string &coPath, hipModule_t *module, hipFunction_t *func) {
+    auto err = hipModuleLoad(module, coPath.c_str());
+    err = hipModuleGetFunction(func, *module, funcName.c_str());
+    return err;
+}
+
 int main(int argc, char **argv) {
     hipDevice_t dev{};
     auto err = hipDeviceGet(&dev, 0);
-    hipModule_t module;
     assert(argc == 3);
     constexpr uint32_t n = 16;
     const std::string coPath(argv[1]);
@@ -174,11 +213,22 @@ int main(int argc, char **argv) {
     const std::uint32_t numElements = m * n;
     float *gpuMem{};
     std::vector<float> cpuMem(numElements, 0);
-    randomize(begin(cpuMem), end(cpuMem));
+    //randomize(begin(cpuMem), end(cpuMem));
+    std::iota(begin(cpuMem), end(cpuMem), 0.f);
     err = hipMalloc(&gpuMem, sizeof(float) * numElements);
     err = hipMemcpyHtoD(gpuMem, cpuMem.data(), cpuMem.size() * sizeof(float));
     float *hipResult{};
     err = hipMalloc(&hipResult, sizeof(float) * numElements);
+
+    hipModule_t module;
+    hipFunction_t func;
+    err = prepareASMKernel("softmax_func", coPath, &module, &func);
+    err = launchASMSoftmax(func, gpuMem, hipResult, m, n);
+    std::vector<float> asmResult(numElements, 0.f);
+    err = hipMemcpyDtoH(asmResult.data(), hipResult, numElements * sizeof(float));
+    std::vector<float> cpuRef(numElements, 0.f);
+    cpuSoftmax<float, 16>(cpuRef.data(), cpuMem.data(), m);
+    //assert(cpuRef == asmResult);
 
     hipEvent_t beg, end;
     err = hipEventCreate(&beg);
@@ -197,8 +247,8 @@ int main(int argc, char **argv) {
     for (std::size_t i = 0; i < numRuns; ++i) {
         luanchGPUKernel<float, n, rowTile>(hipResult, gpuMem, m);
     }
-    err = hipDeviceSynchronize();
     err = hipEventRecord(end);
+    err = hipDeviceSynchronize();
     float hipDur{};
     err = hipEventElapsedTime(&hipDur, beg, end);
     std::cout << "HIP Softmax func: " << std::to_string(hipDur / numRuns) << " ms ~= " << 2 * numRuns * numElements * sizeof(float) * 1e3 / std::pow(1024.f, 3) / hipDur << " GB/s\n";
