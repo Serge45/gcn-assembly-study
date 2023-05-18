@@ -63,14 +63,14 @@ __global__ void hipGpuSoftmaxKernel(DType *m, const DType *a, std::uint32_t numR
     static_assert((Cols & (Cols - 1)) == 0, "Cols must be power of 2");
     constexpr uint32_t numRowsPerIter = WorkgroupSize / Cols;
     constexpr uint32_t numRowsInBlock = RowTile * numRowsPerIter;
-    constexpr uint32_t prepad = 32;
+    constexpr uint32_t prepad = 0;
     __shared__ DType localBuf[numRowsInBlock][Cols + prepad];
     const uint32_t tId = threadIdx.x;
     const auto lastRowIdx = numRowsInBlock * (blockIdx.x + 1);
     const auto globalReadRowShift = (lastRowIdx <= numRows) ? 0 : (lastRowIdx - numRows);
     const auto row = tId / Cols;
     const auto col = tId & (Cols - 1);
-    const uint32_t ldsPad = row % prepad;
+    const uint32_t ldsPad = row;// % prepad;
     const uint32_t paddedCol = col + ldsPad;
     DType tVal[RowTile];
     globalRead<DType, Cols, RowTile, numRowsPerIter, prepad>(localBuf, tVal, a, row, col, globalReadRowShift, ldsPad);
@@ -125,7 +125,7 @@ template<typename DType, std::uint32_t Cols, std::uint32_t RowTile, std::size_t 
 void hipGpuSoftmax(DType *m, DType *a, std::uint32_t numRows) {
     std::uint32_t numElements = numRows * Cols;
     const std::uint32_t numWorkgroups = std::ceil(numElements / static_cast<float>(RowTile) / WorkgroupSize);
-    std::cout << numWorkgroups << " workgroups will be used\n";
+    //std::cout << numWorkgroups << " workgroups will be used\n";
     hipGpuSoftmaxKernel<DType, Cols, RowTile, WorkgroupSize><<<numWorkgroups, WorkgroupSize>>>(m, a, numRows);
     return;
 }
@@ -184,7 +184,7 @@ hipError_t launchASMSoftmax(hipFunction_t func, float *src, float *dst, std::uin
     err = hipEventRecord(beg);
 
     for (size_t i = 0; i < numRuns; ++i) {
-        err = hipExtModuleLaunchKernel(func, 256, 1, 1, 256, 1, 1, 256 * 4, nullptr, nullptr, launchArgs);
+        err = hipExtModuleLaunchKernel(func, m * n, 1, 1, 256, 1, 1, 256 * sizeof(float), nullptr, nullptr, launchArgs);
     }
 
     err = hipEventRecord(end);
