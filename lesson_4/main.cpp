@@ -70,7 +70,7 @@ __global__ void hipGpuSoftmaxKernel(DType *m, const DType *a, std::uint32_t numR
     const auto globalReadRowShift = (lastRowIdx <= numRows) ? 0 : (lastRowIdx - numRows);
     const auto row = tId / Cols;
     const auto col = tId & (Cols - 1);
-    const uint32_t ldsPad = row;// % prepad;
+    const uint32_t ldsPad = 0;//row % prepad;
     const uint32_t paddedCol = col + ldsPad;
     DType tVal[RowTile];
     globalRead<DType, Cols, RowTile, numRowsPerIter, prepad>(localBuf, tVal, a, row, col, globalReadRowShift, ldsPad);
@@ -216,8 +216,8 @@ int main(int argc, char **argv) {
     const std::uint32_t numElements = m * n;
     float *gpuMem{};
     std::vector<float> cpuMem(numElements, 0);
-    randomize(begin(cpuMem), end(cpuMem));
-    //std::iota(begin(cpuMem), end(cpuMem), 0.f);
+    // randomize(begin(cpuMem), end(cpuMem));
+    std::iota(begin(cpuMem), end(cpuMem), 0.f);
     err = hipMalloc(&gpuMem, sizeof(float) * numElements);
     err = hipMemcpyHtoD(gpuMem, cpuMem.data(), cpuMem.size() * sizeof(float));
     float *hipResult{};
@@ -226,7 +226,7 @@ int main(int argc, char **argv) {
     hipModule_t module;
     hipFunction_t func;
     err = prepareASMKernel("softmax_func", coPath, &module, &func);
-    err = launchASMSoftmax(func, gpuMem, hipResult, 50, m, n);
+    err = launchASMSoftmax(func, gpuMem, hipResult, m, n, 50);
     std::vector<float> asmResult(numElements, 0.f);
     err = hipMemcpyDtoH(asmResult.data(), hipResult, numElements * sizeof(float));
     std::vector<float> cpuRef(numElements, 0.f);
@@ -235,6 +235,8 @@ int main(int argc, char **argv) {
     for (std::size_t i = 0; i < numElements; ++i) {
         if (!almostEqual(asmResult[i], cpuRef[i])) {
             std::cout << "ASM kernel vs CPU mismatched!!\n";
+            std::cout << "Idx: " << i << '\n';
+            std::cout << "Diff: " << std::abs(asmResult[i] - cpuRef[i]) << '\n';
             return EXIT_FAILURE;
         }
     }
@@ -273,9 +275,11 @@ int main(int argc, char **argv) {
     std::vector<float> hipReturnedResult(numElements);
     err = hipMemcpyDtoH(hipReturnedResult.data(), hipResult, sizeof(float) * numElements);
     std::size_t numMismatched{};
+    float maxDiff = 0;
 
     for (size_t i = 0; i < numElements; ++i) {
         if (!almostEqual(hipResult[i], cpuOut[i])) {
+            maxDiff = std::max(maxDiff, std::abs(hipReturnedResult[i] - cpuOut[i]));
             // std::cout << "Check HIP vs CPU failed at: " << i
             //     << ", " << std::to_string(hipReturnedResult[i])
             //     << " : " << std::to_string(cpuOut[i])
@@ -287,6 +291,7 @@ int main(int argc, char **argv) {
     }
 
     std::cout << "Mismatched: " << numMismatched << '\n';
+    std::cout << "Max diff: " << maxDiff << '\n';
 
     err = hipFree(gpuMem);
     err = hipModuleUnload(module);
