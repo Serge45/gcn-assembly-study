@@ -149,7 +149,7 @@ void cpuSoftmax(DType *m, DType *a, std::uint32_t numRows) {
 
 template<typename DType, std::uint32_t Cols, std::uint32_t RowTile>
 void luanchGPUKernel(DType *dst, DType *src, std::uint32_t nRows) {
-    static_assert(Cols == 16, "Should not reach here");
+    //static_assert(Cols == 16, "Should not reach here");
     if constexpr (Cols == 16) {
         if (nRows == 1) {
             hipGpuSoftmax<DType, Cols, RowTile, Cols>(dst, src, nRows);
@@ -159,6 +159,10 @@ void luanchGPUKernel(DType *dst, DType *src, std::uint32_t nRows) {
             hipGpuSoftmax<DType, Cols, RowTile, 1024>(dst, src, nRows);
         }
     }
+}
+
+std::uint32_t getNumWorkgroups(std::size_t m, std::size_t n, std::size_t tileM, std::size_t tileN) {
+    return ((m / tileM) + !!(m % tileM)) * ((n / tileN) + !!(n % tileN));
 }
 
 hipError_t launchASMSoftmax(hipFunction_t func, float *src, float *dst, std::uint32_t m, std::uint32_t n, std::size_t numRuns, bool sync = true) {
@@ -182,9 +186,10 @@ hipError_t launchASMSoftmax(hipFunction_t func, float *src, float *dst, std::uin
     err = hipEventCreate(&end);
 
     err = hipEventRecord(beg);
+    const auto numWorkgroups = getNumWorkgroups(m, n, 16, 16);
 
     for (size_t i = 0; i < numRuns; ++i) {
-        err = hipExtModuleLaunchKernel(func, m * n, 1, 1, 256, 1, 1, 256 * sizeof(float), nullptr, nullptr, launchArgs);
+        err = hipExtModuleLaunchKernel(func, numWorkgroups * 16 * 16, 1, 1, 256, 1, 1, 256 * sizeof(float), nullptr, nullptr, launchArgs);
     }
 
     err = hipEventRecord(end);
@@ -197,6 +202,7 @@ hipError_t launchASMSoftmax(hipFunction_t func, float *src, float *dst, std::uin
     float dur{};
     err = hipEventElapsedTime(&dur, beg, end);
     std::cout << "ASM kernel time: " << std::to_string(dur / numRuns) << " ms\n";
+    std::cout << "Perf: " << numRuns * m * n * 2 * sizeof(float) * 1e3 / std::pow(1024.f, 3) / dur << " GB/s\n";
     return err;
 }
 
@@ -216,7 +222,7 @@ int main(int argc, char **argv) {
     const std::uint32_t numElements = m * n;
     float *gpuMem{};
     std::vector<float> cpuMem(numElements, 0);
-    // randomize(begin(cpuMem), end(cpuMem));
+    //randomize(begin(cpuMem), end(cpuMem));
     std::iota(begin(cpuMem), end(cpuMem), 0.f);
     err = hipMalloc(&gpuMem, sizeof(float) * numElements);
     err = hipMemcpyHtoD(gpuMem, cpuMem.data(), cpuMem.size() * sizeof(float));
@@ -230,12 +236,13 @@ int main(int argc, char **argv) {
     std::vector<float> asmResult(numElements, 0.f);
     err = hipMemcpyDtoH(asmResult.data(), hipResult, numElements * sizeof(float));
     std::vector<float> cpuRef(numElements, 0.f);
-    cpuSoftmax<float, 16>(cpuRef.data(), cpuMem.data(), m);
+    cpuSoftmax<float, n>(cpuRef.data(), cpuMem.data(), m);
 
     for (std::size_t i = 0; i < numElements; ++i) {
         if (!almostEqual(asmResult[i], cpuRef[i])) {
             std::cout << "ASM kernel vs CPU mismatched!!\n";
             std::cout << "Idx: " << i << '\n';
+            std::cout << asmResult[i] << " vs " << cpuRef[i] << '\n';
             std::cout << "Diff: " << std::abs(asmResult[i] - cpuRef[i]) << '\n';
             return EXIT_FAILURE;
         }

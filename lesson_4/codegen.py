@@ -44,6 +44,16 @@ def asm_func(func_name: str, module: ti.Module):
         module.add(ti.TextBlock(f'{end_label_name}:\n'))
         module.add(ti.TextBlock(f'.size {func_name}, {end_label_name} - {func_name}\n'))
 
+@contextmanager
+def auto_exec_scope(sgpr_pool: ti.RegisterPool, module: ti.Module):
+    try:
+        tmp_exec_reg_idx = sgpr_pool.checkOut(2)
+        module.add(ti.SMovB64(ti.sgpr(tmp_exec_reg_idx, 2), ti.EXEC()))
+        yield
+    finally:
+        module.add(ti.SMovB64(ti.EXEC(), ti.sgpr(tmp_exec_reg_idx, 2)))
+        sgpr_pool.checkIn(tmp_exec_reg_idx)
+
 class SoftmaxKernelGenerator:
     srd_num_reg = 4
     srd_alignment = 4
@@ -58,9 +68,9 @@ class SoftmaxKernelGenerator:
         self.num_cols = num_cols
         self.num_rows = num_rows
         self.num_workitems = num_workitems
-        self.sgpr_pool = ti.RegisterPool(16, 's', True)
+        self.sgpr_pool = ti.RegisterPool(18, 's', True)
         self.vgpr_pool = ti.RegisterPool(10, 'v', True)
-        self.sgpr_pool.addRange(3, 15) #TODO: estimate this
+        self.sgpr_pool.addRange(3, 17) #TODO: estimate this
         self.vgpr_pool.addRange(1, 9) #TODO: estimate this
         self.func_name = 'softmax_func'
         self.strides = strides
@@ -148,7 +158,7 @@ class SoftmaxKernelGenerator:
         self.sgpr_pool.checkIn(num_elem_reg_idx)
         return module, input_srd_idx, output_srd_idx, m_reg_idx, n_reg_idx
 
-    def local_offset(self) -> Tuple[ti.Module, int]:
+    def local_offset(self, stride_reg_idx: Optional[int]) -> Tuple[ti.Module, int]:
         module = ti.Module()
         t_id_reg_idx = self.t_id_reg_idx
         tmp_reg_idx = self.vgpr_pool.checkOut(2)
@@ -156,14 +166,21 @@ class SoftmaxKernelGenerator:
         row_idx_reg_idx = tmp_reg_idx + 1
         byte_offset_reg_idx = self.vgpr_pool.checkOut(1)
         module.add(ti.vectorStaticDivideAndRemainder(row_idx_reg_idx, col_idx_reg_idx, t_id_reg_idx, self.num_cols, None))
-        module.add(ti.staticMultiply(ti.vgpr(byte_offset_reg_idx), ti.vgpr(row_idx_reg_idx), self.num_cols, None))
+
+        if not stride_reg_idx:
+            module.add(ti.staticMultiply(ti.vgpr(byte_offset_reg_idx), ti.vgpr(row_idx_reg_idx), self.num_cols, None))
+        else:
+            module.add(ti.VMulLOU32(ti.vgpr(byte_offset_reg_idx), ti.vgpr(row_idx_reg_idx), ti.sgpr(stride_reg_idx)))
+
         module.add(ti.VAddU32(ti.vgpr(byte_offset_reg_idx), ti.vgpr(byte_offset_reg_idx), ti.vgpr(col_idx_reg_idx)))
         module.add(ti.staticMultiply(ti.vgpr(byte_offset_reg_idx), ti.vgpr(byte_offset_reg_idx), self.bpe, None))
         self.vgpr_pool.checkIn(tmp_reg_idx)
         return module, byte_offset_reg_idx
 
     @record_num_calls
-    def global_read(self, srd_reg_idx: int, soffset_reg_idx: int, ext_local_read_byte_offset_reg_idx: Optional[int], sync: bool):
+    def global_read(self, srd_reg_idx: int,
+                    soffset_reg_idx: int,
+                    n_reg_idx: int, sync: bool):
         '''
         col_idx = t_id % num_cols
         row_idx = t_id / num_cols
@@ -176,19 +193,14 @@ class SoftmaxKernelGenerator:
         if self.debug_label:
             module.add(ti.Label(f'global_read_{self.global_read.num_calls()}', 'global read begins'))
 
-        if ext_local_read_byte_offset_reg_idx:
-            local_offset_mod, byte_offset_reg_idx = self.local_offset()
-            module.add(local_offset_mod)
-        else:
-            byte_offset_reg_idx = ext_local_read_byte_offset_reg_idx
+        local_offset_mod, byte_offset_reg_idx = self.local_offset(n_reg_idx)
+        module.add(local_offset_mod)
 
         num_elem_read = 1
         BufferLoadType = self.global_read_inst_type(num_elem_read)
         data_reg_idx = self.vgpr_pool.checkOut(1)
         module.add(BufferLoadType(ti.vgpr(data_reg_idx), ti.vgpr(byte_offset_reg_idx), ti.sgpr(srd_reg_idx, self.srd_num_reg), ti.sgpr(soffset_reg_idx), ti.MUBUFModifiers(offen=True)))
-
-        if ext_local_read_byte_offset_reg_idx:
-            self.vgpr_pool.checkIn(byte_offset_reg_idx)
+        self.vgpr_pool.checkIn(byte_offset_reg_idx)
 
         if sync:
             module.add(ti.SWaitCnt(vmcnt=0))
@@ -319,7 +331,7 @@ class SoftmaxKernelGenerator:
         self.vgpr_pool.checkIn(data_reg_idx_0)
         return module
 
-    def reduction_sum(self) -> ti.Module:
+    def reduction_sum(self, n_reg_idx: int) -> ti.Module:
         module = ti.Module()
 
         if self.debug_label:
@@ -337,20 +349,30 @@ class SoftmaxKernelGenerator:
         module.add(ti.staticMultiply(ti.vgpr(byte_offset_reg_idx), ti.vgpr(byte_offset_reg_idx), self.bpe, None))
         module.add(ti.VMovB32(ti.vgpr(l_reg_idx), ti.vgpr(byte_offset_reg_idx)))
 
-        for i in range(num_iter):
-            s = self.num_cols >> (i + 1)
-            assert s > 0
-            cmp_byte_rel_offset = s * self.bpe
-            module.add(ti.VCmpXGtU32(ti.VCC(), hex(s), ti.vgpr(col_reg_idx)))
-            module.add(ti.VAddU32(ti.vgpr(r_reg_idx), ti.vgpr(l_reg_idx), cmp_byte_rel_offset))
-            module.add(self.lds_sum(l_reg_idx, r_reg_idx))
+        with ti.allocTmpGpr(self.sgpr_pool, 2, self.sgpr_pool.size(), 1) as tmp_sgpr_res:
+            cmp_res_reg_idx = tmp_sgpr_res.idx
+            reduction_col_reg_idx = self.vgpr_pool.checkOut(1)
 
-        module.add(ti.SMovB64(ti.EXEC(), hex(0xffffffffffffffff)))
+            for i in range(num_iter):
+                with auto_exec_scope(self.sgpr_pool, module):
+                    s = self.num_cols >> (i + 1)
+                    assert s > 0
+                    cmp_byte_rel_offset = s * self.bpe
+                    module.add(ti.VAddU32(ti.vgpr(reduction_col_reg_idx), ti.vgpr(col_reg_idx), hex(s)))
+                    module.add(ti.VCmpLeU32(ti.sgpr(cmp_res_reg_idx, 2), ti.vgpr(col_reg_idx), ti.sgpr(n_reg_idx)))
+                    module.add(ti.VCmpGtU32(ti.VCC(), hex(s), ti.vgpr(col_reg_idx)))
+                    module.add(ti.SAndB64(ti.sgpr(cmp_res_reg_idx, 2), ti.sgpr(cmp_res_reg_idx, 2), ti.VCC()))
+                    module.add(ti.VCmpLtU32(ti.VCC(), ti.vgpr(reduction_col_reg_idx), ti.sgpr(n_reg_idx)))
+                    module.add(ti.SAndB64(ti.EXEC(), ti.sgpr(cmp_res_reg_idx, 2), ti.VCC()))
+                    module.add(ti.VAddU32(ti.vgpr(r_reg_idx), ti.vgpr(l_reg_idx), cmp_byte_rel_offset))
+                    module.add(self.lds_sum(l_reg_idx, r_reg_idx))
+
+            self.vgpr_pool.checkIn(reduction_col_reg_idx)
 
         self.vgpr_pool.checkIn(l_reg_idx)
         return module
 
-    def reduction_max(self) -> ti.Module:
+    def reduction_max(self, n_reg_idx: int) -> ti.Module:
         module = ti.Module()
 
         if self.debug_label:
@@ -368,15 +390,25 @@ class SoftmaxKernelGenerator:
         module.add(ti.staticMultiply(ti.vgpr(byte_offset_reg_idx), ti.vgpr(byte_offset_reg_idx), self.bpe, None))
         module.add(ti.VMovB32(ti.vgpr(l_reg_idx), ti.vgpr(byte_offset_reg_idx)))
 
-        for i in range(num_iter):
-            s = self.num_cols >> (i + 1)
-            assert s > 0
-            cmp_byte_rel_offset = s * self.bpe
-            module.add(ti.VCmpXGtU32(ti.VCC(), hex(s), ti.vgpr(col_reg_idx)))
-            module.add(ti.VAddU32(ti.vgpr(r_reg_idx), ti.vgpr(l_reg_idx), cmp_byte_rel_offset))
-            module.add(self.lds_max(l_reg_idx, r_reg_idx))
+        with ti.allocTmpGpr(self.sgpr_pool, 2, self.sgpr_pool.size(), 1) as tmp_sgpr_res:
+            cmp_res_reg_idx = tmp_sgpr_res.idx
+            reduction_col_reg_idx = self.vgpr_pool.checkOut(1)
 
-        module.add(ti.SMovB64(ti.EXEC(), hex(0xffffffffffffffff)))
+            for i in range(num_iter):
+                with auto_exec_scope(self.sgpr_pool, module):
+                    s = self.num_cols >> (i + 1)
+                    assert s > 0
+                    cmp_byte_rel_offset = s * self.bpe
+                    module.add(ti.VAddU32(ti.vgpr(reduction_col_reg_idx), ti.vgpr(col_reg_idx), hex(s)))
+                    module.add(ti.VCmpLeU32(ti.sgpr(cmp_res_reg_idx, 2), ti.vgpr(col_reg_idx), ti.sgpr(n_reg_idx)))
+                    module.add(ti.VCmpGtU32(ti.VCC(), hex(s), ti.vgpr(col_reg_idx)))
+                    module.add(ti.SAndB64(ti.sgpr(cmp_res_reg_idx, 2), ti.sgpr(cmp_res_reg_idx, 2), ti.VCC()))
+                    module.add(ti.VCmpLtU32(ti.VCC(), ti.vgpr(reduction_col_reg_idx), ti.sgpr(n_reg_idx)))
+                    module.add(ti.SAndB64(ti.EXEC(), ti.sgpr(cmp_res_reg_idx, 2), ti.VCC()))
+                    module.add(ti.VAddU32(ti.vgpr(r_reg_idx), ti.vgpr(l_reg_idx), cmp_byte_rel_offset))
+                    module.add(self.lds_max(l_reg_idx, r_reg_idx))
+
+            self.vgpr_pool.checkIn(reduction_col_reg_idx)
 
         self.vgpr_pool.checkIn(l_reg_idx)
         return module
@@ -408,8 +440,10 @@ class SoftmaxKernelGenerator:
         mod.add(ti.VMulF32(ti.vgpr(data_reg_idx), ti.vgpr(data_reg_idx), ti.vgpr(sum_reg_idx)))
         return mod
 
-    def global_write_data(self, data_reg_idx: int, srd_reg_idx: int,
-                          ext_local_read_byte_offset: Optional[int],
+    def global_write_data(self,
+                          data_reg_idx: int,
+                          srd_reg_idx: int,
+                          n_reg_idx: int,
                           wg_byte_offset_reg_idx: int,
                           sync: bool):
         module = ti.Module()
@@ -417,19 +451,20 @@ class SoftmaxKernelGenerator:
         if self.debug_label:
             module.add(ti.Label('global_write_data', 'global write begins'))
 
-        if not ext_local_read_byte_offset:
-            local_offset_mod, local_byte_offset_reg_idx = self.local_offset()
+        with auto_exec_scope(self.sgpr_pool, module):
+            col_reg_idx = self.vgpr_pool.checkOut(1)
+            module.add(ti.vectorStaticRemainder(None, col_reg_idx, self.t_id_reg_idx, self.num_cols, None, None))
+            module.add(ti.VCmpXLtU32(ti.VCC(), ti.vgpr(col_reg_idx), ti.sgpr(n_reg_idx)))
+            self.vgpr_pool.checkIn(col_reg_idx)
+            local_offset_mod, local_byte_offset_reg_idx = self.local_offset(n_reg_idx)
             module.add(local_offset_mod)
-        else:
-            local_byte_offset_reg_idx = ext_local_read_byte_offset
 
-        GlobalWriteInstType = self.global_write_inst_type(1)
-        module.add(GlobalWriteInstType(ti.vgpr(data_reg_idx), ti.vgpr(local_byte_offset_reg_idx), ti.sgpr(srd_reg_idx, self.srd_num_reg), ti.sgpr(wg_byte_offset_reg_idx), ti.MUBUFModifiers(offen=True)))
+            GlobalWriteInstType = self.global_write_inst_type(1)
+            module.add(GlobalWriteInstType(ti.vgpr(data_reg_idx), ti.vgpr(local_byte_offset_reg_idx), ti.sgpr(srd_reg_idx, self.srd_num_reg), ti.sgpr(wg_byte_offset_reg_idx), ti.MUBUFModifiers(offen=True)))
 
-        if sync:
-            module.add(ti.SWaitCnt(vmcnt=0))
+            if sync:
+                module.add(ti.SWaitCnt(vmcnt=0))
 
-        if not ext_local_read_byte_offset:
             self.vgpr_pool.checkIn(local_byte_offset_reg_idx)
         return module
 
@@ -446,14 +481,14 @@ class SoftmaxKernelGenerator:
             mod.add(kernel_args_load_mod)
             wg_offset_mod, wg_offset_reg_idx = self.setup_global_read_wg_offset(n_reg_idx)
             mod.add(wg_offset_mod)
-            local_offset_mod, local_offset_byte_offset_reg_idx = self.local_offset()
+            local_offset_mod, local_offset_byte_offset_reg_idx = self.local_offset(None)
             mod.add(local_offset_mod)
-            gl_mod, data_reg_idx = self.global_read(input_srd, wg_offset_reg_idx, local_offset_byte_offset_reg_idx, True)
+            gl_mod, data_reg_idx = self.global_read(input_srd, wg_offset_reg_idx, n_reg_idx, True)
             mod.add(gl_mod)
             mod.add(self.local_write(data_reg_idx, 1, local_offset_byte_offset_reg_idx, True))
 
             if self.numerically_stable:
-                mod.add(self.reduction_max())
+                mod.add(self.reduction_max(n_reg_idx))
                 max_addr_mod, max_reg_idx = self.max_elem()
                 mod.add(max_addr_mod)
                 mod.add(self.sub_max(data_reg_idx, max_reg_idx))
@@ -461,12 +496,12 @@ class SoftmaxKernelGenerator:
 
             mod.add(self.exp(data_reg_idx))
             mod.add(self.local_write(data_reg_idx, 1, local_offset_byte_offset_reg_idx, True))
-            mod.add(self.reduction_sum())
+            mod.add(self.reduction_sum(n_reg_idx))
             sum_elem_mod, sum_reg_idx = self.sum_elem()
             mod.add(sum_elem_mod)
             mod.add(self.div_sum(data_reg_idx, sum_reg_idx))
             self.vgpr_pool.checkIn(sum_reg_idx)
-            gw_mod = self.global_write_data(data_reg_idx, output_srd, local_offset_byte_offset_reg_idx, wg_offset_reg_idx, True)
+            gw_mod = self.global_write_data(data_reg_idx, output_srd, n_reg_idx, wg_offset_reg_idx, True)
             mod.add(gw_mod)
             mod.add(ti.SEndpgm())
             self.sgpr_pool.checkIn(input_srd)
