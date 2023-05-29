@@ -186,7 +186,7 @@ hipError_t launchASMSoftmax(hipFunction_t func, float *src, float *dst, std::uin
     err = hipEventCreate(&end);
 
     err = hipEventRecord(beg);
-    const auto numWorkgroups = getNumWorkgroups(m, n, 16, 16);
+    const auto numWorkgroups = getNumWorkgroups(m, n, 8, 32);
 
     for (size_t i = 0; i < numRuns; ++i) {
         err = hipExtModuleLaunchKernel(func, numWorkgroups * 16 * 16, 1, 1, 256, 1, 1, 256 * sizeof(float), nullptr, nullptr, launchArgs);
@@ -222,8 +222,8 @@ int main(int argc, char **argv) {
     const std::uint32_t numElements = m * n;
     float *gpuMem{};
     std::vector<float> cpuMem(numElements, 0);
-    //randomize(begin(cpuMem), end(cpuMem));
-    std::iota(begin(cpuMem), end(cpuMem), 0.f);
+    randomize(begin(cpuMem), end(cpuMem));
+    //std::iota(begin(cpuMem), end(cpuMem), 0.f);
     err = hipMalloc(&gpuMem, sizeof(float) * numElements);
     err = hipMemcpyHtoD(gpuMem, cpuMem.data(), cpuMem.size() * sizeof(float));
     float *hipResult{};
@@ -231,7 +231,7 @@ int main(int argc, char **argv) {
 
     hipModule_t module;
     hipFunction_t func;
-    err = prepareASMKernel("softmax_func", coPath, &module, &func);
+    err = prepareASMKernel("Softmax_DT_S_MT_8_32", coPath, &module, &func);
     err = launchASMSoftmax(func, gpuMem, hipResult, m, n, 50);
     std::vector<float> asmResult(numElements, 0.f);
     err = hipMemcpyDtoH(asmResult.data(), hipResult, numElements * sizeof(float));

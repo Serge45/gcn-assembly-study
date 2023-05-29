@@ -5,6 +5,7 @@ from typing import List, Tuple, Optional, Union
 from math import log2, log
 import os
 import yaml
+import json
 import subprocess
 from contextlib import contextmanager
 import Tensile.TensileInstructions as ti
@@ -26,8 +27,8 @@ def record_num_calls(f):
 
     return wrapper
 
-def kernel_header(name: str):
-    return f'''.amdgcn_target "amdgcn-amd-amdhsa--gfx90a:xnack-"
+def kernel_header(name: str, gfx_arch: str):
+    return f'''.amdgcn_target "amdgcn-amd-amdhsa--{gfx_arch}:xnack-"
 .text
 .global {name}
 .p2align 8
@@ -62,7 +63,6 @@ class SoftmaxKernelGenerator:
                  io_type: ti.DataType,
                  num_cols: int,
                  num_rows: int,
-                 strides: Tuple[int, int],
                  num_workitems: int):
         self.io_type = io_type
         self.num_cols = num_cols
@@ -72,12 +72,56 @@ class SoftmaxKernelGenerator:
         self.vgpr_pool = ti.RegisterPool(10, 'v', True)
         self.sgpr_pool.addRange(3, 17) #TODO: estimate this
         self.vgpr_pool.addRange(1, 9) #TODO: estimate this
-        self.func_name = 'softmax_func'
-        self.strides = strides
         self.t_id_reg_idx = 0 #TODO: support config on this
         self.wg_id_reg_idx = 2 #TODO: support config on this
         self.numerically_stable = True
         self.debug_label = True
+
+    def _validate(self):
+        assert self.num_cols * self.num_rows == self.num_workitems
+
+    @property
+    def func_name(self):
+        return f'Softmax_DT_{self.io_type}_MT_{self.num_rows}_{self.num_cols}'
+
+    def dumps(self, format: str) -> str:
+        param_dict = {
+            'io_type': self.io_type.toChar(),
+            'num_cols': self.num_cols,
+            'num_rows': self.num_rows,
+            'num_workitems': self.num_workitems,
+            'func_name': self.func_name,
+            'numerically_stable': self.numerically_stable,
+            'debug_label': self.debug_label
+        }
+
+        if format.lower() == 'yaml':
+            return yaml.dump(param_dict)
+        elif format.lower() == 'json':
+            return json.dumps(param_dict)
+        else:
+            assert False, f'Unsupported format {format}'
+
+    def dump(self, format: str, output_path: str):
+        s = self.dumps(format)
+        with open(output_path, 'w') as f:
+            f.write(s)
+
+    def loads(self, format: str, data: str):
+        if format.lower() == 'yaml':
+            param_dict = yaml.load(data, yaml.SafeLoader)
+        elif format.lower() == 'json':
+            param_dict = json.loads(data)
+        else:
+            assert False, f'Unsupported format: {format}'
+
+        self.io_type = ti.DataType(param_dict['io_type'])
+        self.num_cols = param_dict['num_cols']
+        self.num_rows = param_dict['num_rows']
+        self.num_workitems = param_dict['num_workitems']
+        self.func_name = param_dict['func_name']
+        self.numerically_stable = param_dict['numerically_stable']
+        self.debug_label = param_dict['debug_label']
 
     def local_write_inst_type(self, num_elements: int):
         if self.io_type.isSingle():
@@ -358,13 +402,13 @@ class SoftmaxKernelGenerator:
                     s = self.num_cols >> (i + 1)
                     assert s > 0
                     cmp_byte_rel_offset = s * self.bpe
-                    module.add(ti.VAddU32(ti.vgpr(reduction_col_reg_idx), ti.vgpr(col_reg_idx), hex(s)))
+                    module.add(ti.VAddU32(ti.vgpr(reduction_col_reg_idx), hex(s), ti.vgpr(col_reg_idx)))
                     module.add(ti.VCmpLeU32(ti.sgpr(cmp_res_reg_idx, 2), ti.vgpr(col_reg_idx), ti.sgpr(n_reg_idx)))
                     module.add(ti.VCmpGtU32(ti.VCC(), hex(s), ti.vgpr(col_reg_idx)))
                     module.add(ti.SAndB64(ti.sgpr(cmp_res_reg_idx, 2), ti.sgpr(cmp_res_reg_idx, 2), ti.VCC()))
                     module.add(ti.VCmpLtU32(ti.VCC(), ti.vgpr(reduction_col_reg_idx), ti.sgpr(n_reg_idx)))
                     module.add(ti.SAndB64(ti.EXEC(), ti.sgpr(cmp_res_reg_idx, 2), ti.VCC()))
-                    module.add(ti.VAddU32(ti.vgpr(r_reg_idx), ti.vgpr(l_reg_idx), cmp_byte_rel_offset))
+                    module.add(ti.VAddU32(ti.vgpr(r_reg_idx), hex(cmp_byte_rel_offset), ti.vgpr(l_reg_idx)))
                     module.add(self.lds_sum(l_reg_idx, r_reg_idx))
 
             self.vgpr_pool.checkIn(reduction_col_reg_idx)
@@ -399,13 +443,13 @@ class SoftmaxKernelGenerator:
                     s = self.num_cols >> (i + 1)
                     assert s > 0
                     cmp_byte_rel_offset = s * self.bpe
-                    module.add(ti.VAddU32(ti.vgpr(reduction_col_reg_idx), ti.vgpr(col_reg_idx), hex(s)))
+                    module.add(ti.VAddU32(ti.vgpr(reduction_col_reg_idx), hex(s), ti.vgpr(col_reg_idx)))
                     module.add(ti.VCmpLeU32(ti.sgpr(cmp_res_reg_idx, 2), ti.vgpr(col_reg_idx), ti.sgpr(n_reg_idx)))
                     module.add(ti.VCmpGtU32(ti.VCC(), hex(s), ti.vgpr(col_reg_idx)))
                     module.add(ti.SAndB64(ti.sgpr(cmp_res_reg_idx, 2), ti.sgpr(cmp_res_reg_idx, 2), ti.VCC()))
                     module.add(ti.VCmpLtU32(ti.VCC(), ti.vgpr(reduction_col_reg_idx), ti.sgpr(n_reg_idx)))
                     module.add(ti.SAndB64(ti.EXEC(), ti.sgpr(cmp_res_reg_idx, 2), ti.VCC()))
-                    module.add(ti.VAddU32(ti.vgpr(r_reg_idx), ti.vgpr(l_reg_idx), cmp_byte_rel_offset))
+                    module.add(ti.VAddU32(ti.vgpr(r_reg_idx), hex(cmp_byte_rel_offset), ti.vgpr(l_reg_idx)))
                     module.add(self.lds_max(l_reg_idx, r_reg_idx))
 
             self.vgpr_pool.checkIn(reduction_col_reg_idx)
@@ -589,17 +633,27 @@ def meta_str(kernels: Tuple[KernelMeta]):
 
 if __name__ == '__main__':
     ap = ArgumentParser()
-    ap.add_argument('-o', '--output', type=str, required=True)
+    ap.add_argument('-o', '--output', type=str, required=True, help='Output path of compiled binary')
+    ap.add_argument('-m', type=int, default=16, help='Dimension 0 of tile')
+    ap.add_argument('-n', type=int, default=16, help='Dimension 1 of tile')
+    ap.add_argument('--toolchain', type=str, default='/opt/rocm/llvm/bin/clang++', help='Path to ROCm compiler')
+    ap.add_argument('--debug-build', type=bool, default=False, help='Build with debug information')
+    ap.add_argument('--arch', type=str, default='gfx90a', help='Target architecture for assembler, e.g. gfx908. Default is gfx90a')
     args = ap.parse_args()
     output_path: str = args.output
-    ti.Base._global_ti.init((9, 0, 10), '/opt/rocm/llvm/bin/clang++', False)
-    softmax = SoftmaxKernelGenerator(ti.DataType('S'), 16, 16, (16, 1), 256)
+    m: int = args.m
+    n: int = args.n
+    toolchain_path: str = args.toolchain
+    debug_build: bool = args.debug_build
+    arch: str = args.arch
+    ti.Base._global_ti.init((9, 0, 10), toolchain_path, False)
+    softmax = SoftmaxKernelGenerator(ti.DataType('S'), n, m, 256)
     kernel_body = softmax.softmax_kernel_body()
     args = softmax.kernel_args()
     func_name = softmax.func_name
     meta = KernelMeta(func_name, softmax.vgpr_pool.size(), softmax.sgpr_pool.size(), 0, 64, 256, 8, args)
     meta.update_args_offsets()
-    k_str = '\n'.join([kernel_header(func_name),
+    k_str = '\n'.join([kernel_header(func_name, arch),
                        str(kernel_body),
                        kernel_rodata(func_name),
                        meta_str((meta,))])
@@ -609,7 +663,12 @@ if __name__ == '__main__':
 
     output_path_basename = os.path.splitext(output_path)[0]
 
-    ret = subprocess.run(['/opt/rocm/llvm/bin/clang++', '-x', 'assembler', '-target', 'amdgcn-amd-amdhsa', '-mcode-object-version=4', '-mcpu=gfx90a:xnack-', '-mwavefrontsize64', '-c', '-g', '-o', f'{output_path_basename}.o', f'{output_path_basename}.s'])
+    if debug_build:
+        build_args = ['-x', 'assembler', '-target', 'amdgcn-amd-amdhsa', '-mcode-object-version=4', f'-mcpu={arch}:xnack-', '-mwavefrontsize64', '-c', '-g', '-o', f'{output_path_basename}.o', f'{output_path_basename}.s']
+    else:
+        build_args = ['-x', 'assembler', '-target', 'amdgcn-amd-amdhsa', '-mcode-object-version=4', f'-mcpu={arch}:xnack-', '-mwavefrontsize64', '-c', '-o', f'{output_path_basename}.o', f'{output_path_basename}.s']
+
+    ret = subprocess.run([toolchain_path] + build_args)
     print(ret)
-    ret = subprocess.run(['/opt/rocm/llvm/bin/clang++', '-target', 'amdcgn-amdhsa', '-o', f'{output_path_basename}.co', f'{output_path_basename}.o'])
+    ret = subprocess.run([toolchain_path, '-target', 'amdcgn-amdhsa', '-o', f'{output_path_basename}.co', f'{output_path_basename}.o'])
     print(ret)
