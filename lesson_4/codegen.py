@@ -1,3 +1,25 @@
+################################################################################
+#
+# Copyright (C) 2023 Advanced Micro Devices, Inc. All rights reserved.
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell cop-
+# ies of the Software, and to permit persons to whom the Software is furnished
+# to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in all
+# copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IM-
+# PLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS
+# FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR
+# COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER
+# IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNE-
+# CTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+################################################################################
+
 from argparse import ArgumentParser
 from dataclasses import dataclass
 from functools import wraps
@@ -9,12 +31,8 @@ import json
 import subprocess
 from contextlib import contextmanager
 import Tensile.TensileInstructions as ti
-
-class VDivScaleF32(ti.CommonInstruction):
-    def __init__(self, dst, vcc, src0, src1, src2, vop3: Optional[ti.VOP3PModifiers] = None, comment="") -> None:
-        super().__init__(ti.InstType.INST_F32, dst, [src0, src1, src2], None, vop3, comment)
-        self.dst1 = vcc
-        self.setInst("v_div_scale_f32")
+from Tensile.Common import detectGlobalCurrentISA, restoreDefaultGlobalParameters, \
+    assignGlobalParameters, getGfxName, gfxArch, globalParameters
 
 def record_num_calls(f):
     @wraps(f)
@@ -28,7 +46,7 @@ def record_num_calls(f):
     return wrapper
 
 def kernel_header(name: str, gfx_arch: str):
-    return f'''.amdgcn_target "amdgcn-amd-amdhsa--{gfx_arch}:xnack-"
+    return f'''.amdgcn_target "amdgcn-amd-amdhsa--{gfx_arch}"
 .text
 .global {name}
 .p2align 8
@@ -48,12 +66,25 @@ def asm_func(func_name: str, module: ti.Module):
 @contextmanager
 def auto_exec_scope(sgpr_pool: ti.RegisterPool, module: ti.Module):
     try:
-        tmp_exec_reg_idx = sgpr_pool.checkOut(2)
+        tmp_exec_reg_idx = sgpr_pool.checkOutAligned(2, 2)
         module.add(ti.SMovB64(ti.sgpr(tmp_exec_reg_idx, 2), ti.EXEC()))
         yield
     finally:
         module.add(ti.SMovB64(ti.EXEC(), ti.sgpr(tmp_exec_reg_idx, 2)))
         sgpr_pool.checkIn(tmp_exec_reg_idx)
+
+@contextmanager
+def asm_loop(sgpr_pool: ti.RegisterPool, module: ti.Module, name: str):
+    try:
+        reg = sgpr_pool.checkOut(1)
+        loop_start_label = ti.Label(name, f'loop {name} starts') 
+        loop_end_label = ti.Label(f'{name}_end', f'loop {name} ends')
+        module.add(ti.SMovB32(ti.sgpr(reg, 1), 0, 'init loop counter'))
+        module.add(loop_start_label)
+        yield ti.RegisterPoolResource(reg, 1), loop_start_label, loop_end_label
+    finally:
+        module.add(loop_end_label)
+        sgpr_pool.checkIn(reg)
 
 class SoftmaxKernelGenerator:
     srd_num_reg = 4
@@ -63,22 +94,37 @@ class SoftmaxKernelGenerator:
                  io_type: ti.DataType,
                  num_cols: int,
                  num_rows: int,
-                 num_workitems: int):
+                 num_workitems: int,
+                 arch: str):
         self.io_type = io_type
         self.num_cols = num_cols
         self.num_rows = num_rows
         self.num_workitems = num_workitems
-        self.sgpr_pool = ti.RegisterPool(18, 's', True)
+        self.sgpr_pool = ti.RegisterPool(20, 's', True)
         self.vgpr_pool = ti.RegisterPool(10, 'v', True)
-        self.sgpr_pool.addRange(3, 17) #TODO: estimate this
+        self.sgpr_pool.addRange(3, 19) #TODO: estimate this
         self.vgpr_pool.addRange(1, 9) #TODO: estimate this
         self.t_id_reg_idx = 0 #TODO: support config on this
         self.wg_id_reg_idx = 2 #TODO: support config on this
         self.numerically_stable = True
         self.debug_label = True
+        self.arch = arch
+        self.op = 'Softmax'
+
+    @property
+    def num_external_iters(self) -> int:
+        return (self.num_cols * self.num_rows) // self.num_workitems
+
+    @property
+    def num_rows_processed_per_iter(self) -> int:
+        return self.num_workitems // self.num_cols
 
     def _validate(self):
-        assert self.num_cols * self.num_rows == self.num_workitems
+        assert (self.num_cols * self.num_rows) % self.num_workitems == 0
+
+    @property
+    def lds_usage_byte(self) -> int:
+        return self.num_cols * self.num_rows_processed_per_iter * self.io_type.numBytes()
 
     @property
     def func_name(self):
@@ -92,7 +138,9 @@ class SoftmaxKernelGenerator:
             'num_workitems': self.num_workitems,
             'func_name': self.func_name,
             'numerically_stable': self.numerically_stable,
-            'debug_label': self.debug_label
+            'debug_label': self.debug_label,
+            'arch': self.arch,
+            'op': self.op
         }
 
         if format.lower() == 'yaml':
@@ -122,6 +170,8 @@ class SoftmaxKernelGenerator:
         self.func_name = param_dict['func_name']
         self.numerically_stable = param_dict['numerically_stable']
         self.debug_label = param_dict['debug_label']
+        self.arch = param_dict['arch']
+        self.op = param_dict['op']
 
     def local_write_inst_type(self, num_elements: int):
         if self.io_type.isSingle():
@@ -222,7 +272,7 @@ class SoftmaxKernelGenerator:
         return module, byte_offset_reg_idx
 
     @record_num_calls
-    def global_read(self, srd_reg_idx: int,
+    def global_read(self, srd_reg_idx: Union[int, str],
                     soffset_reg_idx: int,
                     n_reg_idx: int, sync: bool):
         '''
@@ -285,7 +335,7 @@ class SoftmaxKernelGenerator:
 
         wg_id_reg_idx = self.wg_id_reg_idx
         wg_byte_offset_reg_idx = self.sgpr_pool.checkOut(1)
-        byte_offset = (self.num_workitems // self.num_cols) * self.bpe
+        byte_offset = self.num_rows * self.bpe
         mod.add(ti.SMulI32(ti.sgpr(wg_byte_offset_reg_idx), ti.sgpr(wg_id_reg_idx), hex(byte_offset)))
         mod.add(ti.SMulI32(ti.sgpr(wg_byte_offset_reg_idx), ti.sgpr(wg_byte_offset_reg_idx), ti.sgpr(stride0_reg_idx)))
         return mod, wg_byte_offset_reg_idx
@@ -393,7 +443,7 @@ class SoftmaxKernelGenerator:
         module.add(ti.staticMultiply(ti.vgpr(byte_offset_reg_idx), ti.vgpr(byte_offset_reg_idx), self.bpe, None))
         module.add(ti.VMovB32(ti.vgpr(l_reg_idx), ti.vgpr(byte_offset_reg_idx)))
 
-        with ti.allocTmpGpr(self.sgpr_pool, 2, self.sgpr_pool.size(), 1) as tmp_sgpr_res:
+        with ti.allocTmpGpr(self.sgpr_pool, 2, self.sgpr_pool.size(), 2) as tmp_sgpr_res:
             cmp_res_reg_idx = tmp_sgpr_res.idx
             reduction_col_reg_idx = self.vgpr_pool.checkOut(1)
 
@@ -416,7 +466,7 @@ class SoftmaxKernelGenerator:
         self.vgpr_pool.checkIn(l_reg_idx)
         return module
 
-    def reduction_max(self, n_reg_idx: int) -> ti.Module:
+    def reduction_max(self, n_reg_idx: Union[int, str]) -> ti.Module:
         module = ti.Module()
 
         if self.debug_label:
@@ -434,7 +484,7 @@ class SoftmaxKernelGenerator:
         module.add(ti.staticMultiply(ti.vgpr(byte_offset_reg_idx), ti.vgpr(byte_offset_reg_idx), self.bpe, None))
         module.add(ti.VMovB32(ti.vgpr(l_reg_idx), ti.vgpr(byte_offset_reg_idx)))
 
-        with ti.allocTmpGpr(self.sgpr_pool, 2, self.sgpr_pool.size(), 1) as tmp_sgpr_res:
+        with ti.allocTmpGpr(self.sgpr_pool, 2, self.sgpr_pool.size(), 2) as tmp_sgpr_res:
             cmp_res_reg_idx = tmp_sgpr_res.idx
             reduction_col_reg_idx = self.vgpr_pool.checkOut(1)
 
@@ -518,43 +568,84 @@ class SoftmaxKernelGenerator:
                 KernelArgument(4, 16, 'by_value'),
                 KernelArgument(4, 20, 'by_value'))
 
-    def softmax_kernel_body(self):
+    def increment_row_tile_addr(self, srd_reg_indices: Tuple[Union[int, str]], stride_reg_idx: Union[int, str]) -> ti.Module:
+        mod = ti.Module()
+
+        def higher_bits(reg_idx):
+            if isinstance(reg_idx, int):
+                return reg_idx + 1
+            elif isinstance(reg_idx, str):
+                return f'{reg_idx}+1'
+
+        with ti.allocTmpGpr(self.sgpr_pool, 1, self.sgpr_pool.size(), None) as tmpRes:
+            mod.add(ti.SMulI32(ti.sgpr(tmpRes.idx, tmpRes.size),
+                               ti.sgpr(stride_reg_idx, 1),
+                               self.bpe * self.num_rows_processed_per_iter))
+            for srd_reg_idx in set(srd_reg_indices):
+                mod.add(ti.SAddU32(ti.sgpr(srd_reg_idx, 1), ti.sgpr(srd_reg_idx, 1), ti.sgpr(tmpRes.idx, tmpRes.size), 'lower bits'))
+                srd_addr_higher_bits = higher_bits(srd_reg_idx)
+                mod.add(ti.SAddCU32(ti.sgpr(srd_addr_higher_bits, 1), ti.sgpr(srd_addr_higher_bits, 1), 0, 'higher bits'))
+        return mod
+
+    def increment_row_tile_offset(self, wg_offset_reg_indices: Tuple[Union[int, str]], stride_reg_idx: Union[int, str]) -> ti.Module:
+        mod = ti.Module()
+
+        with ti.allocTmpGpr(self.sgpr_pool, 1, self.sgpr_pool.size(), None) as tmpRes:
+            mod.add(ti.SMulI32(ti.sgpr(tmpRes.idx, tmpRes.size),
+                               ti.sgpr(stride_reg_idx, 1),
+                               self.bpe * self.num_rows_processed_per_iter))
+            for wg_offset_reg_idx in set(wg_offset_reg_indices):
+                mod.add(ti.SAddU32(ti.sgpr(wg_offset_reg_idx, 1), ti.sgpr(wg_offset_reg_idx, 1), ti.sgpr(tmpRes.idx, tmpRes.size)))
+        return mod
+
+    def softmax_kernel_body(self) -> ti.Module:
         mod = ti.Module(self.func_name)
         with asm_func(self.func_name, mod):
             kernel_args_load_mod, input_srd, output_srd, m_reg_idx, n_reg_idx = self.load_kernel_args()
             mod.add(kernel_args_load_mod)
             wg_offset_mod, wg_offset_reg_idx = self.setup_global_read_wg_offset(n_reg_idx)
             mod.add(wg_offset_mod)
-            local_offset_mod, local_offset_byte_offset_reg_idx = self.local_offset(None)
-            mod.add(local_offset_mod)
-            gl_mod, data_reg_idx = self.global_read(input_srd, wg_offset_reg_idx, n_reg_idx, True)
-            mod.add(gl_mod)
-            mod.add(self.local_write(data_reg_idx, 1, local_offset_byte_offset_reg_idx, True))
 
-            if self.numerically_stable:
-                mod.add(self.reduction_max(n_reg_idx))
-                max_addr_mod, max_reg_idx = self.max_elem()
-                mod.add(max_addr_mod)
-                mod.add(self.sub_max(data_reg_idx, max_reg_idx))
-                self.vgpr_pool.checkIn(max_reg_idx)
+            with asm_loop(self.sgpr_pool, mod, 'ext_loop') as (loop_counter_res, start_label, end_label):
+                local_offset_mod, local_offset_byte_offset_reg_idx = self.local_offset(None)
+                mod.add(local_offset_mod)
+                gl_mod, data_reg_idx = self.global_read(input_srd, wg_offset_reg_idx, n_reg_idx, True)
+                mod.add(gl_mod)
+                mod.add(self.local_write(data_reg_idx, 1, local_offset_byte_offset_reg_idx, True))
 
-            mod.add(self.exp(data_reg_idx))
-            mod.add(self.local_write(data_reg_idx, 1, local_offset_byte_offset_reg_idx, True))
-            mod.add(self.reduction_sum(n_reg_idx))
-            sum_elem_mod, sum_reg_idx = self.sum_elem()
-            mod.add(sum_elem_mod)
-            mod.add(self.div_sum(data_reg_idx, sum_reg_idx))
-            self.vgpr_pool.checkIn(sum_reg_idx)
-            gw_mod = self.global_write_data(data_reg_idx, output_srd, n_reg_idx, wg_offset_reg_idx, True)
-            mod.add(gw_mod)
+                if self.numerically_stable:
+                    mod.add(self.reduction_max(n_reg_idx))
+                    max_addr_mod, max_reg_idx = self.max_elem()
+                    mod.add(max_addr_mod)
+                    mod.add(self.sub_max(data_reg_idx, max_reg_idx))
+                    self.vgpr_pool.checkIn(max_reg_idx)
+
+                mod.add(self.exp(data_reg_idx))
+                mod.add(self.local_write(data_reg_idx, 1, local_offset_byte_offset_reg_idx, True))
+                mod.add(self.reduction_sum(n_reg_idx))
+                sum_elem_mod, sum_reg_idx = self.sum_elem()
+                mod.add(sum_elem_mod)
+                mod.add(self.div_sum(data_reg_idx, sum_reg_idx))
+                self.vgpr_pool.checkIn(sum_reg_idx)
+                gw_mod = self.global_write_data(data_reg_idx, output_srd, n_reg_idx, wg_offset_reg_idx, False)
+                mod.add(gw_mod)
+                mod.add(ti.SAddU32(ti.sgpr(loop_counter_res.idx, loop_counter_res.size),
+                                   ti.sgpr(loop_counter_res.idx, loop_counter_res.size),
+                                   self.num_rows_processed_per_iter,
+                                   'i += loopStepM'))
+                mod.add(self.increment_row_tile_offset((wg_offset_reg_idx,), n_reg_idx))
+                mod.add(ti.SCmpLtU32(ti.sgpr(loop_counter_res.idx, loop_counter_res.size), self.num_rows, 'check if i < tileM'))
+                mod.add(ti.SCBranchSCC1(start_label.getLabelName()))
+                mod.add(ti.SBranch(end_label.getLabelName()))
+                self.sgpr_pool.checkIn(wg_offset_reg_idx)
+                self.sgpr_pool.checkIn(m_reg_idx)
+                self.sgpr_pool.checkIn(n_reg_idx)
+                self.vgpr_pool.checkIn(data_reg_idx)
+                self.vgpr_pool.checkIn(local_offset_byte_offset_reg_idx)
+
             mod.add(ti.SEndpgm())
             self.sgpr_pool.checkIn(input_srd)
             self.sgpr_pool.checkIn(output_srd)
-            self.sgpr_pool.checkIn(wg_offset_reg_idx)
-            self.sgpr_pool.checkIn(m_reg_idx)
-            self.sgpr_pool.checkIn(n_reg_idx)
-            self.vgpr_pool.checkIn(data_reg_idx)
-            self.vgpr_pool.checkIn(local_offset_byte_offset_reg_idx)
         return mod
 
 def kernel_rodata(name: str):
@@ -592,6 +683,7 @@ class KernelMeta:
     num_vgpr: int
     num_sgpr: int
     num_agpr: int
+    num_lds_bytes: int
     wavefront_size: int
     max_workgroup_size: int
     args_alignment: int
@@ -613,7 +705,7 @@ class KernelMeta:
             '.name': self.name,
             '.symbol': f'{self.name}.kd',
             '.kernarg_segment_size': self._get_args_size(),
-            '.group_segment_fixed_size': 0,
+            '.group_segment_fixed_size': self.num_lds_bytes,
             '.private_segment_fixed_size': 0,
             '.kernarg_segment_align': self.args_alignment,
             '.wavefront_size': self.wavefront_size,
@@ -637,7 +729,8 @@ if __name__ == '__main__':
     ap.add_argument('-m', type=int, default=16, help='Dimension 0 of tile')
     ap.add_argument('-n', type=int, default=16, help='Dimension 1 of tile')
     ap.add_argument('--toolchain', type=str, default='/opt/rocm/llvm/bin/clang++', help='Path to ROCm compiler')
-    ap.add_argument('--debug-build', type=bool, default=False, help='Build with debug information')
+    ap.add_argument('--debug-build', action='store_true', dest='debug_build', help='Build with debug information')
+    ap.set_defaults(debug_build=False)
     ap.add_argument('--arch', type=str, default='gfx90a', help='Target architecture for assembler, e.g. gfx908. Default is gfx90a')
     args = ap.parse_args()
     output_path: str = args.output
@@ -646,12 +739,22 @@ if __name__ == '__main__':
     toolchain_path: str = args.toolchain
     debug_build: bool = args.debug_build
     arch: str = args.arch
-    ti.Base._global_ti.init((9, 0, 10), toolchain_path, False)
-    softmax = SoftmaxKernelGenerator(ti.DataType('S'), n, m, 256)
+    isa = gfxArch(arch)
+
+    if any([not i for i in (arch, toolchain_path, isa)]):
+        restoreDefaultGlobalParameters()
+        assignGlobalParameters({})
+        detectGlobalCurrentISA()
+        isa = globalParameters['CurrentISA']
+        arch = getGfxName(isa)
+        toolchain_path = globalParameters['AssemblerPath']
+
+    ti.Base._global_ti.init(isa, toolchain_path, False)
+    softmax = SoftmaxKernelGenerator(ti.DataType('S'), n, m, 256, arch)
     kernel_body = softmax.softmax_kernel_body()
     args = softmax.kernel_args()
     func_name = softmax.func_name
-    meta = KernelMeta(func_name, softmax.vgpr_pool.size(), softmax.sgpr_pool.size(), 0, 64, 256, 8, args)
+    meta = KernelMeta(func_name, softmax.vgpr_pool.size(), softmax.sgpr_pool.size(), 0, softmax.lds_usage_byte, 64, 256, 8, args)
     meta.update_args_offsets()
     k_str = '\n'.join([kernel_header(func_name, arch),
                        str(kernel_body),
@@ -664,11 +767,10 @@ if __name__ == '__main__':
     output_path_basename = os.path.splitext(output_path)[0]
 
     if debug_build:
-        build_args = ['-x', 'assembler', '-target', 'amdgcn-amd-amdhsa', '-mcode-object-version=4', f'-mcpu={arch}:xnack-', '-mwavefrontsize64', '-c', '-g', '-o', f'{output_path_basename}.o', f'{output_path_basename}.s']
+        build_args = ['-x', 'assembler', '-target', 'amdgcn-amd-amdhsa', '-mcode-object-version=4', f'-mcpu={arch}', '-mwavefrontsize64', '-c', '-g', '-o', f'{output_path_basename}.o', f'{output_path_basename}.s']
     else:
-        build_args = ['-x', 'assembler', '-target', 'amdgcn-amd-amdhsa', '-mcode-object-version=4', f'-mcpu={arch}:xnack-', '-mwavefrontsize64', '-c', '-o', f'{output_path_basename}.o', f'{output_path_basename}.s']
+        build_args = ['-x', 'assembler', '-target', 'amdgcn-amd-amdhsa', '-mcode-object-version=4', f'-mcpu={arch}', '-mwavefrontsize64', '-c', '-o', f'{output_path_basename}.o', f'{output_path_basename}.s']
 
     ret = subprocess.run([toolchain_path] + build_args)
-    print(ret)
     ret = subprocess.run([toolchain_path, '-target', 'amdcgn-amdhsa', '-o', f'{output_path_basename}.co', f'{output_path_basename}.o'])
-    print(ret)
+    softmax.dump('yaml', f'{output_path_basename}.yaml')
