@@ -130,18 +130,18 @@ void hipGpuSoftmax(DType *m, DType *a, std::uint32_t numRows) {
     return;
 }
 
-template<typename DType, std::uint32_t Cols>
-void cpuSoftmax(DType *m, DType *a, std::uint32_t numRows) {
+template<typename DType>
+void cpuSoftmax(DType *m, DType *a, std::uint32_t numRows, std::uint32_t numCols) {
     for (std::uint32_t i = 0; i < numRows; ++i) {
-        const auto rowMax = *std::max_element(a + i * Cols, a + i * Cols + Cols);
+        const auto rowMax = *std::max_element(a + i * numCols, a + i * numCols + numCols);
         auto rowSum = 0.f;
-        std::transform(a + i * Cols, a + i * Cols + Cols, m + i * Cols, [&rowSum, rowMax] (auto v) {
+        std::transform(a + i * numCols, a + i * numCols + numCols, m + i * numCols, [&rowSum, rowMax] (auto v) {
             const auto u = std::exp(v - rowMax);
             rowSum += u;
             return u;
         });
 
-        std::transform(m + i * Cols, m + i * Cols + Cols, m + i * Cols, [rowSum] (auto v) {
+        std::transform(m + i * numCols, m + i * numCols + numCols, m + i * numCols, [rowSum] (auto v) {
             return v / rowSum;
         });
     }
@@ -215,10 +215,10 @@ hipError_t prepareASMKernel(const std::string &funcName, const std::string &coPa
 int main(int argc, char **argv) {
     hipDevice_t dev{};
     auto err = hipDeviceGet(&dev, 0);
-    assert(argc == 3);
-    constexpr uint32_t n = 256;
+    assert(argc == 4);
     const std::string coPath(argv[1]);
     const std::uint32_t m(std::atoi(argv[2]));
+    const std::uint32_t n(std::atoi(argv[3]));
     const std::uint32_t numElements = m * n;
     float *gpuMem{};
     std::vector<float> cpuMem(numElements, 0);
@@ -229,14 +229,14 @@ int main(int argc, char **argv) {
     float *hipResult{};
     err = hipMalloc(&hipResult, sizeof(float) * numElements);
     err = hipMemset(hipResult, 0, sizeof(float) * numElements);
-    hipModule_t module;
-    hipFunction_t func;
+    hipModule_t module{};
+    hipFunction_t func{};
     err = prepareASMKernel("Softmax_DT_S_MT_1_256", coPath, &module, &func);
     err = launchASMSoftmax(func, gpuMem, hipResult, m, n, 50);
     std::vector<float> asmResult(numElements, 0.f);
     err = hipMemcpyDtoH(asmResult.data(), hipResult, numElements * sizeof(float));
     std::vector<float> cpuRef(numElements, 0.f);
-    cpuSoftmax<float, n>(cpuRef.data(), cpuMem.data(), m);
+    cpuSoftmax<float>(cpuRef.data(), cpuMem.data(), m, n);
 
     for (std::size_t i = 0; i < numElements; ++i) {
         if (!almostEqual(asmResult[i], cpuRef[i])) {
@@ -252,29 +252,29 @@ int main(int argc, char **argv) {
     err = hipEventCreate(&beg);
     err = hipEventCreate(&end);
 
-    err = hipEventRecord(beg);
+    // err = hipEventRecord(beg);
 
     constexpr std::size_t numWarmups = 50;
     constexpr std::size_t rowTile = 1;
 
-    for (std::size_t i = 0; i < numWarmups; ++i) {
-        luanchGPUKernel<float, n, rowTile>(hipResult, gpuMem, m);
-    }
+    // for (std::size_t i = 0; i < numWarmups; ++i) {
+    //     luanchGPUKernel<float, n, rowTile>(hipResult, gpuMem, m);
+    // }
 
-    const std::size_t numRuns = 300;
-    for (std::size_t i = 0; i < numRuns; ++i) {
-        luanchGPUKernel<float, n, rowTile>(hipResult, gpuMem, m);
-    }
-    err = hipEventRecord(end);
-    err = hipDeviceSynchronize();
-    float hipDur{};
-    err = hipEventElapsedTime(&hipDur, beg, end);
-    std::cout << "HIP Softmax func: " << std::to_string(hipDur / numRuns) << " ms ~= " << 2 * numRuns * numElements * sizeof(float) * 1e3 / std::pow(1024.f, 3) / hipDur << " GB/s\n";
+    const std::size_t numRuns = 30;
+    // for (std::size_t i = 0; i < numRuns; ++i) {
+    //     luanchGPUKernel<float, n, rowTile>(hipResult, gpuMem, m);
+    // }
+    // err = hipEventRecord(end);
+    // err = hipDeviceSynchronize();
+    // float hipDur{};
+    // err = hipEventElapsedTime(&hipDur, beg, end);
+    // std::cout << "HIP Softmax func: " << std::to_string(hipDur / numRuns) << " ms ~= " << 2 * numRuns * numElements * sizeof(float) * 1e3 / std::pow(1024.f, 3) / hipDur << " GB/s\n";
 
     auto cpuBeg = std::chrono::steady_clock::now();
     std::vector<float> cpuOut(numElements);
     for (std::size_t i = 0; i < numRuns; ++i) {
-        cpuSoftmax<float, n>(cpuOut.data(), cpuMem.data(), m);
+        cpuSoftmax<float>(cpuOut.data(), cpuMem.data(), m, n);
     }
     auto cpuEnd = std::chrono::steady_clock::now();
     std::cout << "CPU Softmax func: " << std::chrono::duration<float, std::milli>(cpuEnd - cpuBeg).count() / numRuns << " ms\n";

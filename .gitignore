@@ -1,2 +1,6 @@
 .vscode
 build
+lesson_4/*.s
+lesson_4/*.yaml
+**/*.o
+**/*.co
