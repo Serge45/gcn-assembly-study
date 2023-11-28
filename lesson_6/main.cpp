@@ -106,9 +106,9 @@ int main(int argc, char **argv) {
     hipFunction_t func;
     err = prepareASMKernel("gemm", argv[1], &mod, &func);
 
-    // if (argc < 4) {
-    //     return -1;
-    // }
+    if (argc < 4) {
+        return -1;
+    }
 
     const uint32_t m = std::atoi(argv[2]);
     const uint32_t n = std::atoi(argv[3]);

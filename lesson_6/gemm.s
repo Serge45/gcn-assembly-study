@@ -61,7 +61,7 @@ label_load_args:
   s_load_dword s[k], s[0:1] 40
   s_load_dword s[alpha], s[0:1] 44
   s_load_dword s[beta], s[0:1] 48
-  s_waitcnt lgkmcnt(2)                       //wait for Srds
+  s_waitcnt lgkmcnt(0)                       //wait for Srds
 label_setup_input_srds:
   s_lshl_b32 s[rowIdx], s[wgIdX], 4          //row index for wg, wgIdX * tileM, e.g. for wg(2,2), row starts from 2 * 16
   s_mul_i32 s[tmp], s[m], s[k]               //compute # of elements for A
