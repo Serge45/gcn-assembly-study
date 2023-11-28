@@ -37,6 +37,7 @@ gemm:
   .set strideCD1, 25
   .set alpha, 23
   .set beta, 26
+  .set kernelArg, 28
   //vgpr
   .set tId, 0
   .set glOffsetA, 1
@@ -52,16 +53,19 @@ gemm:
   .set accData, 5
   .set vTmp, 6
 label_load_args:
-  s_load_dwordx2 s[srdA:srdA+1], s[0:1] 0    //s[4:7] for Srd a
-  s_load_dwordx2 s[srdB:srdB+1], s[0:1] 8    //s[8:11] for Srd b
+  s_load_dwordx4 s[kernelArg:kernelArg+3], s[0:1], 0
+  s_load_dwordx4 s[kernelArg+4:kernelArg+7], s[0:1], 16
+  s_load_dwordx4 s[kernelArg+8:kernelArg+11], s[0:1], 32
+  s_load_dwordx2 s[kernelArg+12:kernelArg+13], s[0:1], 48
   s_mov_b32 s[srdA+3], 0x20000
   s_mov_b32 s[srdB+3], 0x20000
-  s_load_dword s[m], s[0:1] 32
-  s_load_dword s[n], s[0:1] 36
-  s_load_dword s[k], s[0:1] 40
-  s_load_dword s[alpha], s[0:1] 44
-  s_load_dword s[beta], s[0:1] 48
-  s_waitcnt lgkmcnt(0)                       //wait for Srds
+  s_waitcnt lgkmcnt(0)                       //wait for all args
+  s_mov_b64 s[srdA:srdA+1], s[kernelArg:kernelArg+1]
+  s_mov_b64 s[srdB:srdB+1], s[kernelArg+2:kernelArg+3]
+  s_mov_b32 s[alpha], s[kernelArg+11]
+  s_mov_b32 s[beta], s[kernelArg+12]
+  s_mov_b64 s[m:m+1], s[kernelArg+8:kernelArg+9]
+  s_mov_b32 s[k], s[kernelArg+10]
 label_setup_input_srds:
   s_lshl_b32 s[rowIdx], s[wgIdX], 4          //row index for wg, wgIdX * tileM, e.g. for wg(2,2), row starts from 2 * 16
   s_mul_i32 s[tmp], s[m], s[k]               //compute # of elements for A
@@ -102,8 +106,8 @@ label_outer_loop:
   s_cmp_lt_u32 s[kIdx], s[k]
   s_cbranch_scc1 label_outer_loop
 label_load_output_srds:
-  s_load_dwordx2 s[srdC:srdC+1], s[0:1] 16    //s[4:7] for Srd c
-  s_load_dwordx2 s[srdD:srdD+1], s[0:1] 24    //s[8:11] for Srd d
+  s_mov_b64 s[srdC:srdC+1], s[kernelArg+4:kernelArg+5]
+  s_mov_b64 s[srdD:srdD+1], s[kernelArg+6:kernelArg+7]
   s_mov_b32 s[srdC+3], 0x20000
   s_mov_b32 s[srdD+3], 0x20000
   s_mul_i32 s[tmp], s[m], s[n]
@@ -118,7 +122,6 @@ label_setup_output_offsets:
   v_add_u32 v[glOffsetC], v[glOffsetC], v[tRow]
   v_lshlrev_b32 v[glOffsetC], 2, v[glOffsetC]
   v_mov_b32 v[glOffsetD], v[glOffsetC]
-  s_waitcnt lgkmcnt(0)                       //wait for Srds, alpha and beta
 label_load_c:
   buffer_load_dword v[cData], v[glOffsetC], s[srdC:srdC+3], s[loadOffsetC] offen offset:0
   v_mul_f32 v[accData], v[accData], s[alpha]
@@ -156,7 +159,7 @@ amdhsa.kernels:
    .private_segment_fixed_size: 0
    .kernarg_segment_align: 8
    .wavefront_size: 64
-   .sgpr_count: 28
+   .sgpr_count: 42
    .vgpr_count: 9
    .agpr_count: 0
    .max_flat_workgroup_size: 256

@@ -165,6 +165,8 @@ int main(int argc, char **argv) {
     err = hipEventElapsedTime(&dur, start, stop);
     std::cout << "HIP gemm: " << dur / numRuns << " ms\n"
               << "Gflops: " << gflops(m, n, k, dur / numRuns) << '\n';
+
+    (void)hipMemset(gpuD, 0, sizeof(float) * m * n);
     //warmup
     (void)launchASMKernel(func, gpuA, gpuB, gpuC, gpuD, alpha, beta, m, n, k);
     err = hipEventRecord(start);
