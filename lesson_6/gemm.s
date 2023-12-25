@@ -10,7 +10,7 @@ gemm:
   .set numWorkgroups, 256
   .set tileM, 16
   .set tileN, 16
-  .set depthU, 1
+  .set depthU, 16
   //sgpr
   .set srdA, 4
   .set srdB, 8
@@ -96,13 +96,135 @@ label_setup_input_srds:
   v_add_u32 v[glOffsetB], v[glOffsetB], s[kIdx]
   v_lshlrev_b32 v[glOffsetB], 2, v[glOffsetB]     //load offset in byte for B
 label_outer_loop:
+  //iter0
   buffer_load_dword v[aData], v[glOffsetA], s[srdA:srdA+3], s[loadOffsetA] offen offset:0
-  s_add_u32 s[kIdx], s[kIdx], depthU
   v_lshl_add_u32 v[glOffsetA], s[m], 2, v[glOffsetA]
   buffer_load_dword v[bData], v[glOffsetB], s[srdB:srdB+3], s[loadOffsetB] offen offset:0
   v_add_u32 v[glOffsetB], v[glOffsetB], bpe
   s_waitcnt vmcnt(0)
   v_fma_f32 v[accData], v[aData], v[bData], v[accData]
+
+  //iter1
+  buffer_load_dword v[aData], v[glOffsetA], s[srdA:srdA+3], s[loadOffsetA] offen offset:0
+  v_lshl_add_u32 v[glOffsetA], s[m], 2, v[glOffsetA]
+  buffer_load_dword v[bData], v[glOffsetB], s[srdB:srdB+3], s[loadOffsetB] offen offset:0
+  v_add_u32 v[glOffsetB], v[glOffsetB], bpe
+  s_waitcnt vmcnt(0)
+  v_fma_f32 v[accData], v[aData], v[bData], v[accData]
+
+  //iter2
+  buffer_load_dword v[aData], v[glOffsetA], s[srdA:srdA+3], s[loadOffsetA] offen offset:0
+  v_lshl_add_u32 v[glOffsetA], s[m], 2, v[glOffsetA]
+  buffer_load_dword v[bData], v[glOffsetB], s[srdB:srdB+3], s[loadOffsetB] offen offset:0
+  v_add_u32 v[glOffsetB], v[glOffsetB], bpe
+  s_waitcnt vmcnt(0)
+  v_fma_f32 v[accData], v[aData], v[bData], v[accData]
+
+  //iter3
+  buffer_load_dword v[aData], v[glOffsetA], s[srdA:srdA+3], s[loadOffsetA] offen offset:0
+  v_lshl_add_u32 v[glOffsetA], s[m], 2, v[glOffsetA]
+  buffer_load_dword v[bData], v[glOffsetB], s[srdB:srdB+3], s[loadOffsetB] offen offset:0
+  v_add_u32 v[glOffsetB], v[glOffsetB], bpe
+  s_waitcnt vmcnt(0)
+  v_fma_f32 v[accData], v[aData], v[bData], v[accData]
+
+  //iter4
+  buffer_load_dword v[aData], v[glOffsetA], s[srdA:srdA+3], s[loadOffsetA] offen offset:0
+  v_lshl_add_u32 v[glOffsetA], s[m], 2, v[glOffsetA]
+  buffer_load_dword v[bData], v[glOffsetB], s[srdB:srdB+3], s[loadOffsetB] offen offset:0
+  v_add_u32 v[glOffsetB], v[glOffsetB], bpe
+  s_waitcnt vmcnt(0)
+  v_fma_f32 v[accData], v[aData], v[bData], v[accData]
+
+  //iter5
+  buffer_load_dword v[aData], v[glOffsetA], s[srdA:srdA+3], s[loadOffsetA] offen offset:0
+  v_lshl_add_u32 v[glOffsetA], s[m], 2, v[glOffsetA]
+  buffer_load_dword v[bData], v[glOffsetB], s[srdB:srdB+3], s[loadOffsetB] offen offset:0
+  v_add_u32 v[glOffsetB], v[glOffsetB], bpe
+  s_waitcnt vmcnt(0)
+  v_fma_f32 v[accData], v[aData], v[bData], v[accData]
+
+  //iter6
+  buffer_load_dword v[aData], v[glOffsetA], s[srdA:srdA+3], s[loadOffsetA] offen offset:0
+  v_lshl_add_u32 v[glOffsetA], s[m], 2, v[glOffsetA]
+  buffer_load_dword v[bData], v[glOffsetB], s[srdB:srdB+3], s[loadOffsetB] offen offset:0
+  v_add_u32 v[glOffsetB], v[glOffsetB], bpe
+  s_waitcnt vmcnt(0)
+  v_fma_f32 v[accData], v[aData], v[bData], v[accData]
+
+  //iter7
+  buffer_load_dword v[aData], v[glOffsetA], s[srdA:srdA+3], s[loadOffsetA] offen offset:0
+  v_lshl_add_u32 v[glOffsetA], s[m], 2, v[glOffsetA]
+  buffer_load_dword v[bData], v[glOffsetB], s[srdB:srdB+3], s[loadOffsetB] offen offset:0
+  v_add_u32 v[glOffsetB], v[glOffsetB], bpe
+  s_waitcnt vmcnt(0)
+  v_fma_f32 v[accData], v[aData], v[bData], v[accData]
+
+  //iter8
+  buffer_load_dword v[aData], v[glOffsetA], s[srdA:srdA+3], s[loadOffsetA] offen offset:0
+  v_lshl_add_u32 v[glOffsetA], s[m], 2, v[glOffsetA]
+  buffer_load_dword v[bData], v[glOffsetB], s[srdB:srdB+3], s[loadOffsetB] offen offset:0
+  v_add_u32 v[glOffsetB], v[glOffsetB], bpe
+  s_waitcnt vmcnt(0)
+  v_fma_f32 v[accData], v[aData], v[bData], v[accData]
+
+  //iter9
+  buffer_load_dword v[aData], v[glOffsetA], s[srdA:srdA+3], s[loadOffsetA] offen offset:0
+  v_lshl_add_u32 v[glOffsetA], s[m], 2, v[glOffsetA]
+  buffer_load_dword v[bData], v[glOffsetB], s[srdB:srdB+3], s[loadOffsetB] offen offset:0
+  v_add_u32 v[glOffsetB], v[glOffsetB], bpe
+  s_waitcnt vmcnt(0)
+  v_fma_f32 v[accData], v[aData], v[bData], v[accData]
+
+  //iter10
+  buffer_load_dword v[aData], v[glOffsetA], s[srdA:srdA+3], s[loadOffsetA] offen offset:0
+  v_lshl_add_u32 v[glOffsetA], s[m], 2, v[glOffsetA]
+  buffer_load_dword v[bData], v[glOffsetB], s[srdB:srdB+3], s[loadOffsetB] offen offset:0
+  v_add_u32 v[glOffsetB], v[glOffsetB], bpe
+  s_waitcnt vmcnt(0)
+  v_fma_f32 v[accData], v[aData], v[bData], v[accData]
+
+  //iter11
+  buffer_load_dword v[aData], v[glOffsetA], s[srdA:srdA+3], s[loadOffsetA] offen offset:0
+  v_lshl_add_u32 v[glOffsetA], s[m], 2, v[glOffsetA]
+  buffer_load_dword v[bData], v[glOffsetB], s[srdB:srdB+3], s[loadOffsetB] offen offset:0
+  v_add_u32 v[glOffsetB], v[glOffsetB], bpe
+  s_waitcnt vmcnt(0)
+  v_fma_f32 v[accData], v[aData], v[bData], v[accData]
+
+  //iter12
+  buffer_load_dword v[aData], v[glOffsetA], s[srdA:srdA+3], s[loadOffsetA] offen offset:0
+  v_lshl_add_u32 v[glOffsetA], s[m], 2, v[glOffsetA]
+  buffer_load_dword v[bData], v[glOffsetB], s[srdB:srdB+3], s[loadOffsetB] offen offset:0
+  v_add_u32 v[glOffsetB], v[glOffsetB], bpe
+  s_waitcnt vmcnt(0)
+  v_fma_f32 v[accData], v[aData], v[bData], v[accData]
+
+  //iter13
+  buffer_load_dword v[aData], v[glOffsetA], s[srdA:srdA+3], s[loadOffsetA] offen offset:0
+  v_lshl_add_u32 v[glOffsetA], s[m], 2, v[glOffsetA]
+  buffer_load_dword v[bData], v[glOffsetB], s[srdB:srdB+3], s[loadOffsetB] offen offset:0
+  v_add_u32 v[glOffsetB], v[glOffsetB], bpe
+  s_waitcnt vmcnt(0)
+  v_fma_f32 v[accData], v[aData], v[bData], v[accData]
+
+  //iter14
+  buffer_load_dword v[aData], v[glOffsetA], s[srdA:srdA+3], s[loadOffsetA] offen offset:0
+  v_lshl_add_u32 v[glOffsetA], s[m], 2, v[glOffsetA]
+  buffer_load_dword v[bData], v[glOffsetB], s[srdB:srdB+3], s[loadOffsetB] offen offset:0
+  v_add_u32 v[glOffsetB], v[glOffsetB], bpe
+  s_waitcnt vmcnt(0)
+  v_fma_f32 v[accData], v[aData], v[bData], v[accData]
+
+  //iter15
+  buffer_load_dword v[aData], v[glOffsetA], s[srdA:srdA+3], s[loadOffsetA] offen offset:0
+  v_lshl_add_u32 v[glOffsetA], s[m], 2, v[glOffsetA]
+  buffer_load_dword v[bData], v[glOffsetB], s[srdB:srdB+3], s[loadOffsetB] offen offset:0
+  v_add_u32 v[glOffsetB], v[glOffsetB], bpe
+  s_waitcnt vmcnt(0)
+  v_fma_f32 v[accData], v[aData], v[bData], v[accData]
+
+  s_add_u32 s[kIdx], s[kIdx], depthU
   s_cmp_lt_u32 s[kIdx], s[k]
   s_cbranch_scc1 label_outer_loop
 label_load_output_srds:

@@ -192,7 +192,7 @@ int main(int argc, char **argv) {
         }
     }
 
-    // err = hipModuleUnload(mod);
+    err = hipModuleUnload(mod);
     err = hipFree(gpuA);
     err = hipFree(gpuB);
     err = hipFree(gpuC);
