@@ -95,16 +95,17 @@ hipError_t launchASMKernel(hipFunction_t func, const float *a, const float *b, c
         &argSize,
         HIP_LAUNCH_PARAM_END
     };
-    const auto numWorkgroups0 = m / 16 + !!(m % 16);
-    const auto numWorkgroups1 = n / 16 + !!(n % 16);
-    return hipExtModuleLaunchKernel(func, numWorkgroups0 * 256, numWorkgroups1, 1, 256, 1, 1, 0, nullptr, nullptr, args);
+    const auto numWorkgroups0 = m / 32 + !!(m % 32);
+    const auto numWorkgroups1 = n / 32 + !!(n % 32);
+    const auto ldsUsageBytes = 32 * 16 * 2 * sizeof(float);
+    return hipExtModuleLaunchKernel(func, numWorkgroups0 * 256, numWorkgroups1, 1, 256, 1, 1, ldsUsageBytes, nullptr, nullptr, args);
 }
 
 int main(int argc, char **argv) {
     hipError_t err{};
     hipModule_t mod;
     hipFunction_t func;
-    err = prepareASMKernel("gemm", argv[1], &mod, &func);
+    err = prepareASMKernel("gemm_mfma", argv[1], &mod, &func);
 
     if (argc < 4) {
         return -1;
@@ -114,17 +115,20 @@ int main(int argc, char **argv) {
     const uint32_t n = std::atoi(argv[3]);
     const uint32_t k = std::atoi(argv[4]);
     std::vector<float> cpuA(m * k, 1);
-    std::vector<float> cpuB(k * n, 0);
+    std::vector<float> cpuB(k * n, 1);
     std::vector<float> cpuC(m * n, 1);
     std::vector<float> cpuD(m * n, 0);
     // std::iota(begin(cpuA), end(cpuA), 0.f);
     // std::iota(begin(cpuB), end(cpuB), 0.f);
     // std::iota(begin(cpuC), end(cpuC), 0.f);
+    // toIdentity(cpuA.data(), m, k);
+    // toIdentity(cpuB.data(), k, n);
+    // toIdentity(cpuC.data(), m, n);
     randomize(begin(cpuA), end(cpuA));
     randomize(begin(cpuB), end(cpuB));
     randomize(begin(cpuC), end(cpuC));
-    float alpha{2.f};
-    float beta{3.f};
+    float alpha{3.f};
+    float beta{2.f};
     const uint32_t numRuns = 10;
     auto cpuBeg = std::chrono::steady_clock::now();
 
@@ -184,12 +188,27 @@ int main(int argc, char **argv) {
     std::vector<float> gpuResult(m * n, 0);
     err = hipMemcpyDtoH(gpuResult.data(), gpuD, m * n * sizeof(float));
 
+    size_t numMismatches{};
+
     for (size_t i = 0; i < gpuResult.size(); ++i) {
         if (!almostEqual(gpuResult[i], cpuD[i], 1e-3f)) {
             std::cout << "gpu & cpu results mismatched at index: " << i << '\n';
             std::cout << gpuResult[i] << " != " << cpuD[i] << '\n';
-            break;
+            ++numMismatches;
         }
+    }
+
+    std::cout << "# of mismatches: " << numMismatches << '\n';
+
+    if (numMismatches) {
+        std::cout << "A:\n";
+        printMultiDim(cpuA.data(), m, k);
+        std::cout << "B:\n";
+        printMultiDim(cpuB.data(), k, n);
+        std::cout << "Ref:\n";
+        printMultiDim(cpuD.data(), m, n);
+        std::cout << "Actual:\n";
+        printMultiDim(gpuResult.data(), m, n);
     }
 
     err = hipModuleUnload(mod);
