@@ -21,6 +21,7 @@ gemm_mfma:
   .set ldsStrideA, tileM
   .set ldsStrideB, depthU
   .set ldsOffsetB, tileM * depthU * bpe
+  .set prefetchLdsOffset, ldsOffsetB + tileN * depthU * bpe
   //sgpr
   .set srdA, 4
   .set srdB, 8
@@ -47,7 +48,8 @@ gemm_mfma:
   .set strideCD1, 25
   .set alpha, 23
   .set beta, 26
-  .set kernelArg, 28
+  .set kernelArg, 28 //s[28:41]
+  .set ldsStartAddr, 42
   //vgpr
   .set tId, 0
   .set glOffsetA, 1
@@ -110,8 +112,7 @@ label_setup_input_srds:
   v_accvgpr_write_b32 a1, 0
   v_accvgpr_write_b32 a2, 0
   v_accvgpr_write_b32 a3, 0
-label_outer_loop:
-label_vm_read:
+label_vm_read_prefetch:
   //addr for vm read A
   v_and_b32 v[tRow], v[tId], 15          //tRow = (tId % 16) * vw(2)
   v_lshlrev_b32 v[tRow], 1, v[tRow]      //tRow = (tId % 16) * vw(2)
@@ -119,7 +120,6 @@ label_vm_read:
   v_mul_lo_u32 v[glOffsetA], v[tCol], s[strideA1]
   v_add_u32 v[glOffsetA], v[glOffsetA], v[tRow]
   v_lshlrev_b32 v[glOffsetA], 2, v[glOffsetA]
-  buffer_load_dwordx2 v[g2lA:g2lA+1], v[glOffsetA], s[srdA:srdA+3], s[loadOffsetA] offen offset:0
   //addr for vm read B
   v_and_b32 v[tRow], v[tId], 7
   v_lshlrev_b32 v[tRow], 1, v[tRow]
@@ -127,8 +127,8 @@ label_vm_read:
   v_mul_lo_u32 v[glOffsetB], v[tCol], s[strideB1]
   v_add_u32 v[glOffsetB], v[glOffsetB], v[tRow]
   v_lshlrev_b32 v[glOffsetB], 2, v[glOffsetB]
+  buffer_load_dwordx2 v[g2lA:g2lA+1], v[glOffsetA], s[srdA:srdA+3], s[loadOffsetA] offen offset:0
   buffer_load_dwordx2 v[g2lB:g2lB+1], v[glOffsetB], s[srdB:srdB+3], s[loadOffsetB] offen offset:0
-label_lds_write:
   //addr for lds write A
   v_and_b32 v[tRow], v[tId], 15
   v_lshlrev_b32 v[tRow], 1, v[tRow]
@@ -136,8 +136,6 @@ label_lds_write:
   v_mul_lo_u32 v[ldsWriteAddrA], v[tCol], tileM
   v_add_u32 v[ldsWriteAddrA], v[ldsWriteAddrA], v[tRow]
   v_lshlrev_b32 v[ldsWriteAddrA], 2, v[ldsWriteAddrA]
-  s_waitcnt vmcnt(1)
-  ds_write_b64 v[ldsWriteAddrA], v[g2lA:g2lA+1], offset:0
   //addr for lds write B
   v_and_b32 v[tRow], v[tId], 7
   v_lshlrev_b32 v[tRow], 1, v[tRow]
@@ -146,9 +144,15 @@ label_lds_write:
   v_add_u32 v[ldsWriteAddrB], v[ldsWriteAddrB], v[tRow]
   v_lshlrev_b32 v[ldsWriteAddrB], 2, v[ldsWriteAddrB]
   s_waitcnt vmcnt(0)
+  ds_write_b64 v[ldsWriteAddrA], v[g2lA:g2lA+1], offset:0
   ds_write_b64 v[ldsWriteAddrB], v[g2lB:g2lB+1], offset:ldsOffsetB
-  s_waitcnt lgkmcnt(0)
-  s_barrier
+label_vm_read_addr_increment_prefetch:
+  s_mul_i32 s[tmp], s[strideA1], depthU * bpe
+  s_add_u32 s[loadOffsetA], s[loadOffsetA], s[tmp]
+  s_add_u32 s[loadOffsetB], s[loadOffsetB], depthU * bpe
+  s_mov_b32 s[ldsStartAddr], prefetchLdsOffset
+  v_add_u32 v[ldsWriteAddrA], v[ldsWriteAddrA], s[ldsStartAddr]
+  v_add_u32 v[ldsWriteAddrB], v[ldsWriteAddrB], s[ldsStartAddr]
 label_lds_read_addr:
   v_lshrrev_b32 v[waveId], 6, v[tId]
   v_and_b32 v[wtId], wavefrontSize-1, v[tId]
@@ -165,7 +169,6 @@ label_lds_read_addr:
   v_add_u32 v[ldsReadAddrA], v[ldsReadAddrA], v[tRow]
   v_lshlrev_b32 v[ldsReadAddrA], 2, v[ldsReadAddrA]
 label_lds_read_addr_b:
-
   v_and_b32 v[tCol], 15, v[wtId]
   v_lshrrev_b32 v[tRow], 4, v[wtId]
   v_add_u32 v[tRow], v[tRow], 0
@@ -173,6 +176,13 @@ label_lds_read_addr_b:
   v_mul_lo_u32 v[ldsReadAddrB], v[tCol], ldsStrideB 
   v_add_u32 v[ldsReadAddrB], v[ldsReadAddrB], v[tRow]
   v_lshlrev_b32 v[ldsReadAddrB], 2, v[ldsReadAddrB]
+lable_sync_prefetch:
+  s_waitcnt lgkmcnt(0)
+  s_barrier
+label_outer_loop:
+label_vm_read:
+  buffer_load_dwordx2 v[g2lA:g2lA+1], v[glOffsetA], s[srdA:srdA+3], s[loadOffsetA] offen offset:0
+  buffer_load_dwordx2 v[g2lB:g2lB+1], v[glOffsetB], s[srdB:srdB+3], s[loadOffsetB] offen offset:0
 label_unrolled_mac:
   //iter0
   ds_read_b32 v[valuA], v[ldsReadAddrA], offset: 0
@@ -198,12 +208,49 @@ label_unrolled_mac:
   s_waitcnt lgkmcnt(0)
   v_mfma_f32_16x16x4f32 a[0:3], v[valuA], v[valuB], a[0:3]
 
+label_lds_write:
+  s_waitcnt vmcnt(0)
+  ds_write_b64 v[ldsWriteAddrA], v[g2lA:g2lA+1], offset:0
+  ds_write_b64 v[ldsWriteAddrB], v[g2lB:g2lB+1], offset:ldsOffsetB
+  v_add_i32 v[ldsReadAddrA], v[ldsReadAddrA], s[ldsStartAddr]
+  v_add_i32 v[ldsReadAddrB], v[ldsReadAddrB], s[ldsStartAddr]
+  s_mul_i32 s[ldsStartAddr], s[ldsStartAddr], -1
+  v_add_i32 v[ldsWriteAddrA], v[ldsWriteAddrA], s[ldsStartAddr]
+  v_add_i32 v[ldsWriteAddrB], v[ldsWriteAddrB], s[ldsStartAddr]
+
   s_add_u32 s[kIdx], s[kIdx], depthU
   s_mul_i32 s[tmp], s[strideA1], depthU * bpe;
   s_add_u32 s[loadOffsetA], s[loadOffsetA], s[tmp]
   s_add_u32 s[loadOffsetB], s[loadOffsetB], depthU * bpe
-  s_cmp_lt_u32 s[kIdx], s[k]
+  s_add_u32 s[tmp], s[kIdx], depthU
+  s_waitcnt vmcnt(0)
+  s_barrier
+  s_cmp_lt_u32 s[tmp], s[k]
   s_cbranch_scc1 label_outer_loop
+label_prefetch_last_loop:
+  //iter0
+  ds_read_b32 v[valuA], v[ldsReadAddrA], offset: 0
+  ds_read_b32 v[valuB], v[ldsReadAddrB], offset: ldsOffsetB 
+  s_waitcnt lgkmcnt(0)
+  v_mfma_f32_16x16x4f32 a[0:3], v[valuA], v[valuB], a[0:3]
+
+  //iter1
+  ds_read_b32 v[valuA], v[ldsReadAddrA], offset: miK * ldsStrideA * bpe
+  ds_read_b32 v[valuB], v[ldsReadAddrB], offset: ldsOffsetB + miK * bpe
+  s_waitcnt lgkmcnt(0)
+  v_mfma_f32_16x16x4f32 a[0:3], v[valuA], v[valuB], a[0:3]
+
+  //iter2
+  ds_read_b32 v[valuA], v[ldsReadAddrA], offset: 2 * miK * ldsStrideA * bpe
+  ds_read_b32 v[valuB], v[ldsReadAddrB], offset: ldsOffsetB + 2 * miK * bpe
+  s_waitcnt lgkmcnt(0)
+  v_mfma_f32_16x16x4f32 a[0:3], v[valuA], v[valuB], a[0:3]
+
+  //iter3
+  ds_read_b32 v[valuA], v[ldsReadAddrA], offset: 3 * miK * ldsStrideA * bpe
+  ds_read_b32 v[valuB], v[ldsReadAddrB], offset: ldsOffsetB + 3 * miK * bpe
+  s_waitcnt lgkmcnt(0)
+  v_mfma_f32_16x16x4f32 a[0:3], v[valuA], v[valuB], a[0:3]
 
 label_load_output_srds:
   s_mov_b64 s[srdC:srdC+1], s[kernelArg+4:kernelArg+5]
@@ -257,9 +304,9 @@ label_endpgm:
   .amdhsa_system_sgpr_workgroup_id_x 1
   .amdhsa_system_sgpr_workgroup_id_y 1
   .amdhsa_accum_offset 36
-  .amdhsa_group_segment_fixed_size 4096
+  .amdhsa_group_segment_fixed_size 8192
   .amdhsa_next_free_vgpr 56//.amdgcn.next_free_vgpr
-  .amdhsa_next_free_sgpr 42//.amdgcn.next_free_sgpr
+  .amdhsa_next_free_sgpr 43//.amdgcn.next_free_sgpr
 .end_amdhsa_kernel
 
 .amdgpu_metadata
@@ -272,11 +319,11 @@ amdhsa.kernels:
  - .name: gemm_mfma
    .symbol: gemm_mfma.kd
    .kernarg_segment_size: 56
-   .group_segment_fixed_size: 4096
+   .group_segment_fixed_size: 8192
    .private_segment_fixed_size: 0
    .kernarg_segment_align: 8
    .wavefront_size: 64
-   .sgpr_count: 42
+   .sgpr_count: 43
    .vgpr_count: 56
    .agpr_count: 4
    .max_flat_workgroup_size: 256

@@ -75,6 +75,12 @@ double gflops(uint32_t m, uint32_t n, uint32_t k, float durMs) {
     return 2 * m * n * k / durMs * 1e-6;
 }
 
+template<typename T>
+float memBwGiB(size_t m, size_t n, size_t k, float timeMs) {
+    constexpr size_t numBytes = sizeof(T);
+    return (m * k + n * k + 2 * m * n) * numBytes / timeMs / 1024.f / 1024.f;
+}
+
 hipError_t launchASMKernel(hipFunction_t func, const float *a, const float *b, const float *c, float *d, float alpha, float beta, uint32_t m, uint32_t n, uint32_t k) {
     KernelArguments kArgs;
     kArgs.append(a);
@@ -97,7 +103,7 @@ hipError_t launchASMKernel(hipFunction_t func, const float *a, const float *b, c
     };
     const auto numWorkgroups0 = m / 32 + !!(m % 32);
     const auto numWorkgroups1 = n / 32 + !!(n % 32);
-    const auto ldsUsageBytes = 32 * 16 * 2 * sizeof(float);
+    const auto ldsUsageBytes = 32 * 16 * 2 * sizeof(float) * 2;
     return hipExtModuleLaunchKernel(func, numWorkgroups0 * 256, numWorkgroups1, 1, 256, 1, 1, ldsUsageBytes, nullptr, nullptr, args);
 }
 
@@ -130,6 +136,7 @@ int main(int argc, char **argv) {
     float alpha{3.f};
     float beta{2.f};
     const uint32_t numRuns = 10;
+    const uint32_t numWarmupRuns = 50;
     auto cpuBeg = std::chrono::steady_clock::now();
 
     for (uint32_t i = 0; i < numRuns; ++i) {
@@ -153,7 +160,9 @@ int main(int argc, char **argv) {
     err = hipEventCreate(&start);
     err = hipEventCreate(&stop);
     //warmup for HIP kernel
-    launchGpuGemm(gpuA, gpuB, gpuC, gpuD, alpha, beta, m, n, k);
+    for (uint32_t i = 0; i < numWarmupRuns; ++i) {
+        launchGpuGemm(gpuA, gpuB, gpuC, gpuD, alpha, beta, m, n, k);
+    }
     err = hipDeviceSynchronize();
 
     err = hipEventRecord(start);
@@ -168,11 +177,15 @@ int main(int argc, char **argv) {
     float dur{};
     err = hipEventElapsedTime(&dur, start, stop);
     std::cout << "HIP gemm: " << dur / numRuns << " ms\n"
-              << "Gflops: " << gflops(m, n, k, dur / numRuns) << '\n';
+              << "Gflops: " << gflops(m, n, k, dur / numRuns) << '\n'
+              << "GiB/s: " << memBwGiB<float>(m, n, k, dur / numRuns) << '\n';
 
     (void)hipMemset(gpuD, 0, sizeof(float) * m * n);
     //warmup
-    (void)launchASMKernel(func, gpuA, gpuB, gpuC, gpuD, alpha, beta, m, n, k);
+    for (uint32_t i = 0; i < numWarmupRuns; ++i) {
+        (void)launchASMKernel(func, gpuA, gpuB, gpuC, gpuD, alpha, beta, m, n, k);
+    }
+    err = hipDeviceSynchronize();
     err = hipEventRecord(start);
     for (uint32_t i = 0; i < numRuns; ++i) {
         (void)launchASMKernel(func, gpuA, gpuB, gpuC, gpuD, alpha, beta, m, n, k);
@@ -181,7 +194,8 @@ int main(int argc, char **argv) {
     err = hipDeviceSynchronize();
     err = hipEventElapsedTime(&dur, start, stop);
     std::cout << "ASM gemm: " << dur / numRuns << " ms\n"
-              << "Gflops: " << gflops(m, n, k, dur / numRuns) << '\n';
+              << "Gflops: " << gflops(m, n, k, dur / numRuns) << '\n'
+              << "GiB/s: " << memBwGiB<float>(m, n, k, dur / numRuns) << '\n';
 
     err = hipEventDestroy(start);
     err = hipEventDestroy(stop);
