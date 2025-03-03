@@ -74,6 +74,8 @@ gemm_mfma:
   .set valuAcc, 24        //v[24:27]
   .set valuC, 28          //v[28:31]
   .set valuD, 32          //v[32:35]
+  .set valuA1, 36
+  .set valuB1, 37
   //acc
   .set accRes, 0          //a[0:3]
 label_load_args:
@@ -183,34 +185,37 @@ label_outer_loop:
 label_vm_read:
   buffer_load_dwordx2 v[g2lA:g2lA+1], v[glOffsetA], s[srdA:srdA+3], s[loadOffsetA] offen offset:0
   buffer_load_dwordx2 v[g2lB:g2lB+1], v[glOffsetB], s[srdB:srdB+3], s[loadOffsetB] offen offset:0
+label_lds_prefetch:
+  ds_read_b32 v[valuA1], v[ldsReadAddrA], offset: 0
+  ds_read_b32 v[valuB1], v[ldsReadAddrB], offset: ldsOffsetB 
 label_unrolled_mac:
-  //iter0
-  ds_read_b32 v[valuA], v[ldsReadAddrA], offset: 0
-  ds_read_b32 v[valuB], v[ldsReadAddrB], offset: ldsOffsetB 
-  s_waitcnt lgkmcnt(0)
-  v_mfma_f32_16x16x4f32 a[0:3], v[valuA], v[valuB], a[0:3]
-
-  //iter1
   ds_read_b32 v[valuA], v[ldsReadAddrA], offset: miK * ldsStrideA * bpe
   ds_read_b32 v[valuB], v[ldsReadAddrB], offset: ldsOffsetB + miK * bpe
-  s_waitcnt lgkmcnt(0)
-  v_mfma_f32_16x16x4f32 a[0:3], v[valuA], v[valuB], a[0:3]
+  s_waitcnt lgkmcnt(2)
 
-  //iter2
-  ds_read_b32 v[valuA], v[ldsReadAddrA], offset: 2 * miK * ldsStrideA * bpe
-  ds_read_b32 v[valuB], v[ldsReadAddrB], offset: ldsOffsetB + 2 * miK * bpe
-  s_waitcnt lgkmcnt(0)
-  v_mfma_f32_16x16x4f32 a[0:3], v[valuA], v[valuB], a[0:3]
+  //iter0
+  v_mfma_f32_16x16x4f32 a[0:3], v[valuA1], v[valuB1], a[0:3]
+  ds_read_b32 v[valuA1], v[ldsReadAddrA], offset: 2 * miK * ldsStrideA * bpe
+  ds_read_b32 v[valuB1], v[ldsReadAddrB], offset: ldsOffsetB + 2 * miK * bpe
+  s_waitcnt lgkmcnt(2)
 
-  //iter3
+  //iter1
+  v_mfma_f32_16x16x4f32 a[0:3], v[valuA], v[valuB], a[0:3]
   ds_read_b32 v[valuA], v[ldsReadAddrA], offset: 3 * miK * ldsStrideA * bpe
   ds_read_b32 v[valuB], v[ldsReadAddrB], offset: ldsOffsetB + 3 * miK * bpe
+  s_waitcnt lgkmcnt(2)
+
+  //iter2
+  v_mfma_f32_16x16x4f32 a[0:3], v[valuA1], v[valuB1], a[0:3]
   s_waitcnt lgkmcnt(0)
+  s_waitcnt vmcnt(1)
+  ds_write_b64 v[ldsWriteAddrA], v[g2lA:g2lA+1], offset:0
+
+  //iter3
   v_mfma_f32_16x16x4f32 a[0:3], v[valuA], v[valuB], a[0:3]
 
 label_lds_write:
   s_waitcnt vmcnt(0)
-  ds_write_b64 v[ldsWriteAddrA], v[g2lA:g2lA+1], offset:0
   ds_write_b64 v[ldsWriteAddrB], v[g2lB:g2lB+1], offset:ldsOffsetB
   v_add_i32 v[ldsReadAddrA], v[ldsReadAddrA], s[ldsStartAddr]
   v_add_i32 v[ldsReadAddrB], v[ldsReadAddrB], s[ldsStartAddr]
@@ -223,32 +228,31 @@ label_lds_write:
   s_add_u32 s[loadOffsetA], s[loadOffsetA], s[tmp]
   s_add_u32 s[loadOffsetB], s[loadOffsetB], depthU * bpe
   s_add_u32 s[tmp], s[kIdx], depthU
-  s_waitcnt vmcnt(0)
+  s_waitcnt lgkmcnt(0)
   s_barrier
   s_cmp_lt_u32 s[tmp], s[k]
   s_cbranch_scc1 label_outer_loop
 label_prefetch_last_loop:
-  //iter0
-  ds_read_b32 v[valuA], v[ldsReadAddrA], offset: 0
-  ds_read_b32 v[valuB], v[ldsReadAddrB], offset: ldsOffsetB 
-  s_waitcnt lgkmcnt(0)
-  v_mfma_f32_16x16x4f32 a[0:3], v[valuA], v[valuB], a[0:3]
-
-  //iter1
+  ds_read_b32 v[valuA1], v[ldsReadAddrA], offset: 0
+  ds_read_b32 v[valuB1], v[ldsReadAddrB], offset: ldsOffsetB 
   ds_read_b32 v[valuA], v[ldsReadAddrA], offset: miK * ldsStrideA * bpe
   ds_read_b32 v[valuB], v[ldsReadAddrB], offset: ldsOffsetB + miK * bpe
-  s_waitcnt lgkmcnt(0)
+  s_waitcnt lgkmcnt(2)
+  //iter0
+  v_mfma_f32_16x16x4f32 a[0:3], v[valuA1], v[valuB1], a[0:3]
+  ds_read_b32 v[valuA1], v[ldsReadAddrA], offset: 2 * miK * ldsStrideA * bpe
+  ds_read_b32 v[valuB1], v[ldsReadAddrB], offset: ldsOffsetB + 2 * miK * bpe
+  s_waitcnt lgkmcnt(2)
+  //iter1
   v_mfma_f32_16x16x4f32 a[0:3], v[valuA], v[valuB], a[0:3]
-
-  //iter2
-  ds_read_b32 v[valuA], v[ldsReadAddrA], offset: 2 * miK * ldsStrideA * bpe
-  ds_read_b32 v[valuB], v[ldsReadAddrB], offset: ldsOffsetB + 2 * miK * bpe
-  s_waitcnt lgkmcnt(0)
-  v_mfma_f32_16x16x4f32 a[0:3], v[valuA], v[valuB], a[0:3]
-
-  //iter3
   ds_read_b32 v[valuA], v[ldsReadAddrA], offset: 3 * miK * ldsStrideA * bpe
   ds_read_b32 v[valuB], v[ldsReadAddrB], offset: ldsOffsetB + 3 * miK * bpe
+
+  s_waitcnt lgkmcnt(2)
+  //iter2
+  v_mfma_f32_16x16x4f32 a[0:3], v[valuA1], v[valuB1], a[0:3]
+
+  //iter3
   s_waitcnt lgkmcnt(0)
   v_mfma_f32_16x16x4f32 a[0:3], v[valuA], v[valuB], a[0:3]
 
@@ -303,7 +307,7 @@ label_endpgm:
   .amdhsa_user_sgpr_kernarg_segment_ptr 1
   .amdhsa_system_sgpr_workgroup_id_x 1
   .amdhsa_system_sgpr_workgroup_id_y 1
-  .amdhsa_accum_offset 36
+  .amdhsa_accum_offset 40
   .amdhsa_group_segment_fixed_size 8192
   .amdhsa_next_free_vgpr 56//.amdgcn.next_free_vgpr
   .amdhsa_next_free_sgpr 43//.amdgcn.next_free_sgpr
