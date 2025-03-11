@@ -519,9 +519,7 @@ class GpuContext:
         )
 
     @count_gprs
-    def v_mul_lo_u32(
-        self, dst: Vgpr, src0: Vgpr | int | float, src1: Sgpr | Vgpr | int | float
-    ):
+    def v_mul_lo_u32(self, dst: Vgpr, src0: Vgpr | int, src1: Sgpr | Vgpr | int):
         self.instructions.append(
             [
                 lambda: f"v_mul_lo_u32 {str(dst)}, {str(src0)}, {str(src1)}",
@@ -647,9 +645,10 @@ class GemmSolutionConfig:
 
     @property
     def lds_usage_bytes(self) -> int:
-        return 2 * (self.tile_size[0] * self.depth_k * datatype_size(
-            self.a_type
-        ) + self.tile_size[1] * self.depth_k * datatype_size(self.b_type))
+        return 2 * (
+            self.tile_size[0] * self.depth_k * datatype_size(self.a_type)
+            + self.tile_size[1] * self.depth_k * datatype_size(self.b_type)
+        )
 
 
 @gpu_function
@@ -892,6 +891,20 @@ def gemm(
         finally:
             context.sgpr_counter -= num_regs
 
+    @contextmanager
+    def alloc_tmp_vgpr(num_regs: int):
+        vgpr = (
+            VgprRange(context.sgpr_counter, num_regs)
+            if num_regs > 1
+            else Vgpr(context.sgpr_counter)
+        )
+        context.vgpr_counter += num_regs
+        context.max_vgpr = max(context.max_vgpr, context.vgpr_counter)
+        try:
+            yield vgpr
+        finally:
+            context.vgpr_counter -= num_regs
+
     def header():
         return f"""
 .amdgcn_target "amdgcn-amd-amdhsa--{arch}"
@@ -1019,7 +1032,6 @@ def gemm(
                     Vgpr(vgprs.t_row),
                     num_load_threads0_a * gl_num_elements_a,
                     Vgpr(vgprs.t_row),
-                    
                 )
                 context.v_add_u32(
                     Vgpr(vgprs.t_col), num_load_threads1_a, Vgpr(vgprs.t_col)
@@ -1033,7 +1045,7 @@ def gemm(
         context.v_and_b32(
             Vgpr(vgprs.t_row), Vgpr(vgprs.t_id), config.depth_k // gl_num_elements_b - 1
         )
-        context.v_mul_lo_u32(Vgpr(vgprs.t_row), gl_num_elements_b, Vgpr(vgprs.t_row))
+        context.v_mul_lo_u32(Vgpr(vgprs.t_row), Vgpr(vgprs.t_row), gl_num_elements_b)
         context.v_lshlrev_b32(
             Vgpr(vgprs.t_col), int(math.log2(num_load_threads0_b)), Vgpr(vgprs.t_col)
         )
@@ -1053,8 +1065,8 @@ def gemm(
                 )
                 context.v_mul_lo_u32(
                     Vgpr(vgprs.gl_offset_b[j][i]),
-                    datatype_size(config.b_type),
                     Vgpr(vgprs.gl_offset_b[j][i]),
+                    datatype_size(config.b_type),
                 )
                 context.v_add_u32(
                     Vgpr(vgprs.t_row),
@@ -1109,16 +1121,19 @@ def gemm(
             Vgpr(vgprs.t_id),
             config.tile_size[0] // gl_num_elements_a - 1,
         )
-        context.v_mul_lo_u32(Vgpr(vgprs.t_row), gl_num_elements_a, Vgpr(vgprs.t_row))
+
+        context.v_mul_lo_u32(Vgpr(vgprs.t_row), Vgpr(vgprs.t_row), gl_num_elements_a)
         context.v_lshlrev_b32(
             Vgpr(vgprs.t_col), int(math.log2(num_load_threads0_a)), Vgpr(vgprs.t_col)
         )
 
         for j, col in enumerate(vgprs.lw_addr_a):
             for i, row in enumerate(col):
-                context.v_mul_lo_u32(Vgpr(row), config.tile_size[0], Vgpr(vgprs.t_col))
+                with alloc_tmp_sgpr(1) as stmp:
+                    context.s_mov_b32(stmp, config.tile_size[0])
+                    context.v_mul_lo_u32(Vgpr(row), Vgpr(vgprs.t_col), stmp)
                 context.v_add_u32(Vgpr(row), Vgpr(row), Vgpr(vgprs.t_row))
-                context.v_mul_lo_u32(Vgpr(row), datatype_size(config.a_type), Vgpr(row))
+                context.v_mul_lo_u32(Vgpr(row), Vgpr(row), datatype_size(config.a_type))
 
         context.comment("lw_b")
         context.v_and_b32(
@@ -1131,9 +1146,14 @@ def gemm(
 
         for j, col in enumerate(vgprs.lw_addr_b):
             for i, row in enumerate(col):
-                context.v_mul_lo_u32(Vgpr(row), Vgpr(vgprs.t_col), config.depth_k)
+                if config.depth_k > 127:
+                    with alloc_tmp_sgpr(1) as stmp:
+                        context.s_mov_b32(stmp, config.depth_k)
+                        context.v_mul_lo_u32(Vgpr(row), Vgpr(vgprs.t_col), stmp)
+                else:
+                    context.v_mul_lo_u32(Vgpr(row), Vgpr(vgprs.t_col), config.depth_k)
                 context.v_add_u32(Vgpr(row), Vgpr(row), Vgpr(vgprs.t_row))
-                context.v_mul_lo_u32(Vgpr(row), datatype_size(config.b_type), Vgpr(row))
+                context.v_mul_lo_u32(Vgpr(row), Vgpr(row), datatype_size(config.b_type))
 
         context.s_waitcnt(vmcnt=0)
 
@@ -1194,12 +1214,12 @@ def gemm(
                 for i, row in enumerate(col):
                     context.v_add_u32(Vgpr(row), Vgpr(row), tmp_sgpr)
 
-        #TODO: ds read addresses
-        #TODO: sync ds write and barrier
-        #TODO: unrolled loop
-        #TODO: load c
-        #TODO: compute d = a*b+c
-        #TODO: store d
+        # TODO: ds read addresses
+        # TODO: sync ds write and barrier
+        # TODO: unrolled loop
+        # TODO: load c
+        # TODO: compute d = a*b+c
+        # TODO: store d
 
         context.s_endpgm()
         return context.materialize()
