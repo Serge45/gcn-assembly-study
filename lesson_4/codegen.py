@@ -731,7 +731,7 @@ if __name__ == '__main__':
     ap.add_argument('--toolchain', type=str, default='/opt/rocm/llvm/bin/clang++', help='Path to ROCm compiler')
     ap.add_argument('--debug-build', action='store_true', dest='debug_build', help='Build with debug information')
     ap.set_defaults(debug_build=False)
-    ap.add_argument('--arch', type=str, default='gfx90a', help='Target architecture for assembler, e.g. gfx908. Default is gfx90a')
+    ap.add_argument('--arch', type=str, default='gfx942', help='Target architecture for assembler, e.g. gfx908. Default is gfx942')
     args = ap.parse_args()
     output_path: str = args.output
     m: int = args.m

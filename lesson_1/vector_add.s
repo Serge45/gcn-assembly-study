@@ -1,4 +1,4 @@
-.amdgcn_target "amdgcn-amd-amdhsa--gfx90a:xnack-"
+.amdgcn_target "amdgcn-amd-amdhsa--gfx942"
 .text
 .globl vector_add
 .p2align 8
