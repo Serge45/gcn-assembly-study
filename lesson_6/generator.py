@@ -785,6 +785,7 @@ def gemm(
         srd_b: int
         srd_c: int
         srd_d: int
+        kern_args_addr: int
         wg_id_x: int
         wg_id_y: int
         m: int
@@ -846,6 +847,7 @@ def gemm(
             srd_b=8,
             srd_c=4,
             srd_d=8,
+            kern_args_addr=0,
             wg_id_x=2,
             wg_id_y=3,
             m=12,
@@ -1063,7 +1065,7 @@ def gemm(
             if num_sgpr_kernarg >= 4:
                 context.s_load_dwordx4(
                     SgprRange(sgprs.kern_args + kern_arg_sgpr_offset, 4),
-                    SgprRange(0, 2),
+                    SgprRange(sgprs.kern_args_addr, 2),
                     kern_arg_sgpr_offset * 4,
                 )
                 kern_arg_sgpr_offset += 4
@@ -1071,7 +1073,7 @@ def gemm(
             elif num_sgpr_kernarg >= 2:
                 context.s_load_dwordx2(
                     SgprRange(sgprs.kern_args + kern_arg_sgpr_offset, 2),
-                    SgprRange(0, 2),
+                    SgprRange(sgprs.kern_args_addr, 2),
                     kern_arg_sgpr_offset * 4,
                 )
                 kern_arg_sgpr_offset += 2
@@ -1079,7 +1081,7 @@ def gemm(
             else:
                 context.s_load_dword(
                     Sgpr(sgprs.kern_args + kern_arg_sgpr_offset),
-                    SgprRange(0, 2),
+                    SgprRange(sgprs.kern_args_addr, 2),
                     kern_arg_sgpr_offset * 4,
                 )
                 kern_arg_sgpr_offset += 1
@@ -1095,19 +1097,6 @@ def gemm(
         context.s_mov_b32(Sgpr(sgprs.m), Sgpr(sgprs.kern_args + 8))
         context.s_mov_b32(Sgpr(sgprs.n), Sgpr(sgprs.kern_args + 9))
         context.s_mov_b32(Sgpr(sgprs.k), Sgpr(sgprs.kern_args + 10))
-
-        context.comment("Setup global read offsets")
-        context.s_lshl_b32(Sgpr(sgprs.row_idx), Sgpr(sgprs.wg_id_x), 5)
-
-        bpe_log_a = int(math.log2(datatype_size(gemm_config.a_type)))
-        bpe_log_b = int(math.log2(datatype_size(gemm_config.b_type)))
-
-        with alloc_tmp_sgpr(1) as tmp:
-            context.s_mul_i32(tmp, Sgpr(sgprs.m), Sgpr(sgprs.k))
-            context.s_lshl_b32(Sgpr(sgprs.srd_a + 2), tmp, bpe_log_a)
-            context.s_mul_i32(tmp, Sgpr(sgprs.n), Sgpr(sgprs.k))
-            context.s_lshl_b32(Sgpr(sgprs.srd_b + 2), tmp, bpe_log_b)
-
         context.s_mov_b32(Sgpr(sgprs.stride_a_0), 1)
         context.s_mov_b32(Sgpr(sgprs.stride_a_1), Sgpr(sgprs.kern_args + 11))
         context.s_mov_b32(Sgpr(sgprs.stride_b_0), 1)
@@ -1116,6 +1105,21 @@ def gemm(
         context.s_mov_b32(Sgpr(sgprs.stride_c_1), Sgpr(sgprs.kern_args + 13))
         context.s_mov_b32(Sgpr(sgprs.stride_d_0), 1)
         context.s_mov_b32(Sgpr(sgprs.stride_d_1), Sgpr(sgprs.kern_args + 14))
+
+        context.label("setup_gl_offsets")
+        context.comment("Setup global read offsets")
+        context.s_lshl_b32(Sgpr(sgprs.row_idx), Sgpr(sgprs.wg_id_x), int(math.log2(config.tile_size[0])))
+        context.s_lshl_b32(Sgpr(sgprs.col_idx), Sgpr(sgprs.wg_id_y), int(math.log2(config.tile_size[1])))
+
+        bpe_log_a = int(math.log2(datatype_size(gemm_config.a_type)))
+        bpe_log_b = int(math.log2(datatype_size(gemm_config.b_type)))
+
+        with alloc_tmp_sgpr(1) as tmp:
+            context.s_mul_i32(tmp, Sgpr(sgprs.stride_a_1), Sgpr(sgprs.k))
+            context.s_lshl_b32(Sgpr(sgprs.srd_a + 2), tmp, bpe_log_a)
+            context.s_mul_i32(tmp, Sgpr(sgprs.n), Sgpr(sgprs.stride_b_1))
+            context.s_lshl_b32(Sgpr(sgprs.srd_b + 2), tmp, bpe_log_b)
+
         context.s_mul_i32(
             Sgpr(sgprs.gl_offset_a), Sgpr(sgprs.row_idx), Sgpr(sgprs.stride_a_0)
         )
@@ -1256,13 +1260,15 @@ def gemm(
                         0,
                     )
 
+        def gl_increments():
+            with alloc_tmp_sgpr(1) as stmp:
+                context.comment("gl_offset increments for unrolled loop")
+                context.s_mul_i32(stmp, Sgpr(sgprs.stride_a_1), config.depth_k * datatype_size(config.a_type))
+                context.s_add_i32(Sgpr(sgprs.gl_offset_a), Sgpr(sgprs.gl_offset_a), stmp)
+                context.s_add_i32(Sgpr(sgprs.gl_offset_b), Sgpr(sgprs.gl_offset_b), config.depth_k * datatype_size(config.b_type))
+
         gl_a()
         gl_b()
-
-        with alloc_tmp_sgpr(1) as stmp:
-            context.s_mul_i32(stmp, Sgpr(sgprs.stride_a_1), config.depth_k * datatype_size(config.a_type))
-            context.s_add_i32(Sgpr(sgprs.gl_offset_a), Sgpr(sgprs.gl_offset_a), stmp)
-            context.s_add_i32(Sgpr(sgprs.gl_offset_b), Sgpr(sgprs.gl_offset_b), config.depth_k * datatype_size(config.a_type))
 
         context.comment("lw_a")
         context.v_and_b32(
@@ -1333,46 +1339,19 @@ def gemm(
                 )
 
         def gl_increments_swap_lds():
-            with alloc_tmp_sgpr(1) as tmp_sgpr:
-                context.comment("gl_increment_a")
-                context.s_mul_i32(
-                    tmp_sgpr,
-                    Sgpr(sgprs.stride_a_1),
-                    config.depth_k * datatype_size(config.a_type),
-                )
-                context.s_add_i32(
-                    Sgpr(sgprs.gl_offset_a), Sgpr(sgprs.gl_offset_a), tmp_sgpr
-                )
-                context.comment("gl_increment_b")
-                context.s_mul_i32(
-                    tmp_sgpr,
-                    Sgpr(sgprs.stride_b_0),
-                    config.depth_k * datatype_size(config.b_type),
-                )
-                context.s_add_i32(
-                    Sgpr(sgprs.gl_offset_b), Sgpr(sgprs.gl_offset_b), tmp_sgpr
-                )
+            gl_increments()
 
-                context.comment("swap ds write address")
-                context.s_mov_b32(sgprs.lds_start_addr, config.lds_swap_offset_bytes)
-                for j, col in enumerate(vgprs.lw_addr_a):
-                    for i, row in enumerate(col):
-                        context.v_add_u32(Vgpr(row), Vgpr(row), Sgpr(sgprs.lds_start_addr))
-
-                for j, col in enumerate(vgprs.lw_addr_b):
-                    for i, row in enumerate(col):
-                        context.v_add_u32(Vgpr(row), Vgpr(row), Sgpr(sgprs.lds_start_addr))
-
-            gl_increments_swap_lds()
-
+            context.comment("swap ds write address")
+            context.s_mov_b32(Sgpr(sgprs.lds_start_addr), config.lds_swap_offset_bytes)
             for j, col in enumerate(vgprs.lw_addr_a):
                 for i, row in enumerate(col):
-                    context.v_add_u32(Vgpr(row), Vgpr(row), tmp_sgpr)
+                    context.v_add_u32(Vgpr(row), Vgpr(row), Sgpr(sgprs.lds_start_addr))
 
             for j, col in enumerate(vgprs.lw_addr_b):
                 for i, row in enumerate(col):
-                    context.v_add_u32(Vgpr(row), Vgpr(row), tmp_sgpr)
+                    context.v_add_u32(Vgpr(row), Vgpr(row), Sgpr(sgprs.lds_start_addr))
 
+        gl_increments_swap_lds()
         context.label("lds_wave_offsets")
         context.comment("lds read addresses: wave offsets")
         context.v_lshrrev_b32(Vgpr(vgprs.w_id), 6, Vgpr(vgprs.t_id))
