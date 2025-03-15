@@ -143,9 +143,9 @@ class FunctionMeta:
   .amdhsa_user_sgpr_kernarg_segment_ptr 1
   .amdhsa_system_sgpr_workgroup_id_x 1
   .amdhsa_system_sgpr_workgroup_id_y 1
-  .amdhsa_accum_offset {max(self.vgpr_count//4*4, 4)}
+  .amdhsa_accum_offset {max((self.vgpr_count+3)//4*4, 4)}
   .amdhsa_group_segment_fixed_size {self.group_segment_fixed_size}
-  .amdhsa_next_free_vgpr {self.vgpr_count}
+  .amdhsa_next_free_vgpr {self.vgpr_count+self.agpr_count}
   .amdhsa_next_free_sgpr {self.sgpr_count}
 .end_amdhsa_kernel
 """
@@ -778,6 +778,7 @@ def gemm(
 ) -> str:
     meta = FunctionMeta(name, arguments)
     meta.group_segment_fixed_size = config.lds_usage_bytes
+    meta.workgroup_size = config.wave_group[0] * config.wave_group[1] * meta.wavefront_size
 
     @dataclass
     class SgprAlloc:
@@ -1155,30 +1156,35 @@ def gemm(
 
         for j, col in enumerate(vgprs.gl_offset_a):
             for i, row in enumerate(col):
-                context.comment(f"gl_addr_a_{j}_{i}")
-                context.v_mul_lo_u32(
-                    Vgpr(vgprs.gl_offset_a[j][i]),
-                    Vgpr(vgprs.t_col),
-                    Sgpr(sgprs.stride_a_1),
-                )
-                context.v_add_u32(
-                    Vgpr(vgprs.gl_offset_a[j][i]),
-                    Vgpr(vgprs.gl_offset_a[j][i]),
-                    Vgpr(vgprs.t_row),
-                )
-                context.v_mul_lo_u32(
-                    Vgpr(vgprs.gl_offset_a[j][i]),
-                    datatype_size(config.a_type),
-                    Vgpr(vgprs.gl_offset_a[j][i]),
-                )
-                context.v_add_u32(
-                    Vgpr(vgprs.t_row),
-                    num_load_threads0_a * gl_num_elements_a,
-                    Vgpr(vgprs.t_row),
-                )
-                context.v_add_u32(
-                    Vgpr(vgprs.t_col), num_load_threads1_a, Vgpr(vgprs.t_col)
-                )
+                with alloc_tmp_sgpr(1) as stmp:
+                    context.comment(f"gl_addr_a_{i}_{j}")
+                    context.s_mov_b32(stmp, j * num_load_threads1_a)
+                    context.v_add_u32(Vgpr(vgprs.gl_offset_a[j][i]), Vgpr(vgprs.t_col), stmp)
+                    context.v_mul_lo_u32(
+                        Vgpr(vgprs.gl_offset_a[j][i]),
+                        Vgpr(vgprs.gl_offset_a[j][i]),
+                        Sgpr(sgprs.stride_a_1),
+                    )
+                    context.v_add_u32(
+                        Vgpr(vgprs.gl_offset_a[j][i]),
+                        Vgpr(vgprs.gl_offset_a[j][i]),
+                        Vgpr(vgprs.t_row),
+                    )
+                    context.s_mov_b32(stmp, i * num_load_threads0_a * gl_num_elements_a)
+                    context.v_add_u32(Vgpr(vgprs.gl_offset_a[j][i]), Vgpr(vgprs.gl_offset_a[j][i]), stmp)
+                    context.v_mul_lo_u32(
+                        Vgpr(vgprs.gl_offset_a[j][i]),
+                        datatype_size(config.a_type),
+                        Vgpr(vgprs.gl_offset_a[j][i]),
+                    )
+                    # context.v_add_u32(
+                    #     Vgpr(vgprs.t_row),
+                    #     num_load_threads0_a * gl_num_elements_a,
+                    #     Vgpr(vgprs.t_row),
+                    # )
+                    # context.v_add_u32(
+                    #     Vgpr(vgprs.t_col), num_load_threads1_a, Vgpr(vgprs.t_col)
+                    # )
 
         gl_num_elements_b = config.num_bytes_per_buffer_load[1] // datatype_size(
             config.b_type
@@ -1195,30 +1201,35 @@ def gemm(
 
         for j, col in enumerate(vgprs.gl_offset_b):
             for i, row in enumerate(col):
-                context.comment(f"gl_addr_b_{j}_{i}")
-                context.v_mul_lo_u32(
-                    Vgpr(vgprs.gl_offset_b[j][i]),
-                    Vgpr(vgprs.t_col),
-                    Sgpr(sgprs.stride_b_1),
-                )
-                context.v_add_u32(
-                    Vgpr(vgprs.gl_offset_b[j][i]),
-                    Vgpr(vgprs.gl_offset_b[j][i]),
-                    Vgpr(vgprs.t_row),
-                )
-                context.v_mul_lo_u32(
-                    Vgpr(vgprs.gl_offset_b[j][i]),
-                    Vgpr(vgprs.gl_offset_b[j][i]),
-                    datatype_size(config.b_type),
-                )
-                context.v_add_u32(
-                    Vgpr(vgprs.t_row),
-                    num_load_threads0_b * gl_num_elements_b,
-                    Vgpr(vgprs.t_row),
-                )
-                context.v_add_u32(
-                    Vgpr(vgprs.t_col), num_load_threads1_b, Vgpr(vgprs.t_col)
-                )
+                with alloc_tmp_sgpr(1) as stmp:
+                    context.comment(f"gl_addr_b_{i}_{j}")
+                    context.s_mov_b32(stmp, j * num_load_threads1_b)
+                    context.v_add_u32(Vgpr(vgprs.gl_offset_b[j][i]), Vgpr(vgprs.t_col), stmp)
+                    context.v_mul_lo_u32(
+                        Vgpr(vgprs.gl_offset_b[j][i]),
+                        Vgpr(vgprs.gl_offset_b[j][i]),
+                        Sgpr(sgprs.stride_b_1),
+                    )
+                    context.v_add_u32(
+                        Vgpr(vgprs.gl_offset_b[j][i]),
+                        Vgpr(vgprs.gl_offset_b[j][i]),
+                        Vgpr(vgprs.t_row),
+                    )
+                    context.s_mov_b32(stmp, i * num_load_threads0_b * gl_num_elements_b)
+                    context.v_add_u32(Vgpr(vgprs.gl_offset_b[j][i]), Vgpr(vgprs.gl_offset_b[j][i]), stmp)
+                    context.v_mul_lo_u32(
+                        Vgpr(vgprs.gl_offset_b[j][i]),
+                        Vgpr(vgprs.gl_offset_b[j][i]),
+                        datatype_size(config.b_type),
+                    )
+                    # context.v_add_u32(
+                    #     Vgpr(vgprs.t_row),
+                    #     num_load_threads0_b * gl_num_elements_b,
+                    #     Vgpr(vgprs.t_row),
+                    # )
+                    # context.v_add_u32(
+                    #     Vgpr(vgprs.t_col), num_load_threads1_b, Vgpr(vgprs.t_col)
+                    # )
 
         def gl_a():
             context.comment("gl_a")
@@ -1285,8 +1296,12 @@ def gemm(
         for j, col in enumerate(vgprs.lw_addr_a):
             for i, row in enumerate(col):
                 with alloc_tmp_sgpr(1) as stmp:
-                    context.s_mov_b32(stmp, config.tile_size[0])
-                    context.v_mul_lo_u32(Vgpr(row), Vgpr(vgprs.t_col), stmp)
+                    context.comment(f"lw_addr_a_{i}_{j}")
+                    context.s_mov_b32(stmp, j * num_load_threads1_a)
+                    context.v_add_u32(Vgpr(row), Vgpr(vgprs.t_col), stmp)
+                    context.v_mul_lo_u32(Vgpr(row), Vgpr(row), config.tile_size[0])
+                    context.s_mov_b32(stmp, i * num_load_threads0_a * gl_num_elements_a)
+                    context.v_add_u32(Vgpr(row), Vgpr(row), stmp)
                 context.v_add_u32(Vgpr(row), Vgpr(row), Vgpr(vgprs.t_row))
                 context.v_mul_lo_u32(Vgpr(row), Vgpr(row), datatype_size(config.a_type))
 
@@ -1301,12 +1316,13 @@ def gemm(
 
         for j, col in enumerate(vgprs.lw_addr_b):
             for i, row in enumerate(col):
-                if config.depth_k > 127:
-                    with alloc_tmp_sgpr(1) as stmp:
-                        context.s_mov_b32(stmp, config.depth_k)
-                        context.v_mul_lo_u32(Vgpr(row), Vgpr(vgprs.t_col), stmp)
-                else:
-                    context.v_mul_lo_u32(Vgpr(row), Vgpr(vgprs.t_col), config.depth_k)
+                with alloc_tmp_sgpr(1) as stmp:
+                    context.comment(f"lw_addr_b_{i}_{j}")
+                    context.s_mov_b32(stmp, j * num_load_threads1_b)
+                    context.v_add_u32(Vgpr(row), Vgpr(vgprs.t_col), stmp)
+                    context.v_mul_lo_u32(Vgpr(row), Vgpr(row), config.depth_k)
+                    context.s_mov_b32(stmp, i * num_load_threads0_b * gl_num_elements_b)
+                    context.v_add_u32(Vgpr(row), Vgpr(row), stmp)
                 context.v_add_u32(Vgpr(row), Vgpr(row), Vgpr(vgprs.t_row))
                 context.v_mul_lo_u32(Vgpr(row), Vgpr(row), datatype_size(config.b_type))
 
@@ -1419,7 +1435,7 @@ def gemm(
         def mfma():
             for j, col in enumerate(agprs.arpgs):
                 for i, row in enumerate(col):
-                    context.mfma_inst(config.mfma)(AccVgprRange(row, 4), Vgpr(vgprs.valu_a[j][i]), Vgpr(vgprs.valu_b[j][i]), AccVgprRange(row, 4))
+                    context.mfma_inst(config.mfma)(AccVgprRange(row, 4), Vgpr(vgprs.valu_a[0][i]), Vgpr(vgprs.valu_b[j][0]), AccVgprRange(row, 4))
 
         def lw_a():
             for j, col in enumerate(vgprs.lw_addr_a):
@@ -1521,20 +1537,22 @@ def gemm(
 
         for j, col in enumerate(vgprs.gl_offset_d):
             for i, row in enumerate(col):
-                context.comment("setup voffset_c")
+                context.comment(f"gw_addr_{i}_{j}")
                 context.v_and_b32(Vgpr(vgprs.t_col), config.mfma[1]-1, Vgpr(vgprs.wt_id))
+                context.v_add_u32(Vgpr(vgprs.t_col), Vgpr(vgprs.t_col), j * config.wave_group[1] * config.mfma[1])
                 context.v_lshrrev_b32(Vgpr(vgprs.t_row), int(math.log2(config.mfma[1])), Vgpr(vgprs.wt_id))
                 context.v_mul_lo_u32(Vgpr(vgprs.t_row), 4, Vgpr(vgprs.t_row))
+                context.v_add_u32(Vgpr(vgprs.t_row), Vgpr(vgprs.t_row), i * config.wave_group[0] * config.mfma[0])
                 context.v_add_i32(Vgpr(vgprs.t_col), Vgpr(vgprs.t_col), Vgpr(vgprs.w_col))
                 context.v_add_i32(Vgpr(vgprs.t_row), Vgpr(vgprs.t_row), Vgpr(vgprs.w_row))
+                context.comment(f"setup voffset_c_{i}_{j}")
                 context.v_mul_lo_u32(Vgpr(vgprs.gl_offset_c[j][i]), Vgpr(vgprs.t_col), Sgpr(sgprs.stride_c_1))
                 context.v_add_u32(Vgpr(vgprs.gl_offset_c[j][i]), Vgpr(vgprs.gl_offset_c[j][i]), Vgpr(vgprs.t_row))
                 context.v_mul_lo_u32(Vgpr(vgprs.gl_offset_c[j][i]), Vgpr(vgprs.gl_offset_c[j][i]), datatype_size(config.cd_type))
-                context.comment("setup voffset_d")
+                context.comment(f"setup voffset_d_{i}_{j}")
                 context.v_mul_lo_u32(Vgpr(vgprs.gl_offset_d[j][i]), Vgpr(vgprs.t_col), Sgpr(sgprs.stride_d_1))
                 context.v_add_u32(Vgpr(vgprs.gl_offset_d[j][i]), Vgpr(vgprs.gl_offset_d[j][i]), Vgpr(vgprs.t_row))
                 context.v_mul_lo_u32(Vgpr(vgprs.gl_offset_d[j][i]), Vgpr(vgprs.gl_offset_d[j][i]), datatype_size(config.cd_type))
-                #TODO: increment t_col and t_row
 
         context.s_mov_b32(Sgpr(sgprs.alpha), Sgpr(sgprs.kern_args+15))
         context.s_mov_b32(Sgpr(sgprs.beta), Sgpr(sgprs.kern_args+16))
@@ -1542,6 +1560,7 @@ def gemm(
         context.label("gw")
         for j, col in enumerate(agprs.arpgs):
             for i, row in enumerate(col):
+                context.comment(f"gw_{i}_{j}")
                 for r in range(agprs.num_reg_per_thread):
                     context.v_accvgpr_read_b32(Vgpr(vgprs.valu_acc[j][i]+r), AccVgpr(row+r))
                 context.buffer_load_inst(agprs.num_reg_per_thread)(VgprRange(vgprs.valu_c[j][i], agprs.num_reg_per_thread), Vgpr(vgprs.gl_offset_c[j][i]), SgprRange(sgprs.srd_c, 4), Sgpr(gl_offset_c), 0)
@@ -1551,7 +1570,6 @@ def gemm(
                 for r in range(agprs.num_reg_per_thread):
                     context.v_fma_f32(Vgpr(vgprs.valu_acc[j][i]+r), Sgpr(sgprs.beta), Vgpr(vgprs.valu_c[j][i]+r), Vgpr(vgprs.valu_acc[j][i]+r))
                 context.buffer_store_inst(agprs.num_reg_per_thread)(VgprRange(vgprs.valu_acc[j][i], agprs.num_reg_per_thread), Vgpr(vgprs.gl_offset_d[j][i]), SgprRange(sgprs.srd_d, 4), Sgpr(gw_offset_d), 0)
-                #TODO: increment voffset of c & d
 
         context.s_endpgm()
         return context.materialize()
@@ -1567,7 +1585,7 @@ def gemm(
     context.content.write(header())
     context.content.write(body())
     meta.sgpr_count = context.sgpr_counter
-    meta.vgpr_count = context.vgpr_counter+context.agpr_counter
+    meta.vgpr_count = context.vgpr_counter
     meta.agpr_count = context.agpr_counter
     context.content.write(meta.ro_data())
     context.content.write(str(meta))
@@ -1611,8 +1629,6 @@ asm_str = gemm(
         FunctionArgument("by_value", "beta", None, 4),
     ],
 )
-
-print(asm_str)
 
 with open('generated_gemm.s', 'w') as f:
     f.write(asm_str)
