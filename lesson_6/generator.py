@@ -1,11 +1,10 @@
-from typing import Optional, List, Tuple
+from typing import Optional, List, Tuple, Dict
 from contextlib import contextmanager
-from collections import OrderedDict
 import yaml
 from io import StringIO
-from enum import Enum
+from enum import IntEnum
 import subprocess
-import tempfile
+import tomli_w
 from dataclasses import dataclass
 import math
 
@@ -667,7 +666,7 @@ def gpu_function(func):
     return wrapper
 
 
-class DataType(Enum):
+class DataType(IntEnum):
     FP32 = 0
 
 
@@ -703,6 +702,7 @@ class GemmSolutionConfig:
         self.wave_tiling = wave_tiling
         self.depth_k = depth_k
         self.wavefront_size = 64
+        self.name = None
 
     @property
     def tile_size(self) -> Tuple[int, int]:
@@ -767,6 +767,35 @@ class GemmSolutionConfig:
     def num_unrolled_iters(self) -> int:
         return self.depth_k // self.mfma[3]
 
+    def to_dict(self) -> Dict:
+        return {
+            "a_type": int(self.a_type),
+            "b_type": int(self.b_type),
+            "cd_type": int(self.cd_type),
+            "scalar_type": int(self.scalar_type),
+            "wave_group": self.wave_group,
+            "trans_a": self.trans_a,
+            "trans_b": self.trans_b,
+            "mfma": self.mfma,
+            "wave_tiling": self.wave_tiling,
+            "depth_k": self.depth_k,
+            "wavefront_size": self.wavefront_size,
+            "name": self.name if self.name else ""
+        }
+
+    def from_dict(self, d):
+        self.a_type = DataType(d["a_type"])
+        self.b_type = DataType(d["b_type"])
+        self.cd_type = DataType(d["cd_type"])
+        self.scalar_type = DataType(d["scalar_type"])
+        self.wave_group = d["wave_group"]
+        self.trans_a = d["trans_a"]
+        self.trans_b = d["trans_b"]
+        self.mfma = d["mfma"]
+        self.wave_tiling = d["wave_tiling"]
+        self.depth_k = d["depth_k"]
+        self.wavefront_size = d["wavefront_size"]
+        self.name = d["name"]
 
 @gpu_function
 def gemm(
@@ -1599,7 +1628,7 @@ gemm_config = GemmSolutionConfig(
     DataType.FP32,
     (16, 16, 1, 4),
     (2, 2),
-    (1, 1),
+    (2, 2),
     16,
     False,
     False,
@@ -1653,3 +1682,6 @@ with open('generated_gemm.s', 'w') as f:
     ret = subprocess.run(
         [DEFAULT_CLANG_PATH, "-target", "amdgcn-amd-amdhsa", "generated_gemm.o", "-o", "generated_gemm.co"]
     )
+
+with open("generated_gemm.toml", "wb") as f:
+    tomli_w.dump(gemm_config.to_dict(), f)
