@@ -9,6 +9,7 @@ from dataclasses import dataclass
 import math
 
 DEFAULT_CLANG_PATH = "/opt/rocm/llvm/bin/clang++"
+MAX_LDS_NUM_BYTES = 65536
 
 
 class Gpr:
@@ -703,6 +704,9 @@ class GemmSolutionConfig:
         self.depth_k = depth_k
         self.wavefront_size = 64
         self.name = None
+
+        if self.lds_usage_bytes >= MAX_LDS_NUM_BYTES:
+            raise RuntimeError(f"LDS usage exceeds {MAX_LDS_NUM_BYTES}: {self.lds_usage_bytes}")
 
     @property
     def tile_size(self) -> Tuple[int, int]:
@@ -1426,9 +1430,10 @@ def gemm(
                 with alloc_tmp_sgpr(1) as stmp:
                     context.s_mov_b32(stmp, config.tile_size[0])
                     context.v_mul_lo_u32(Vgpr(row), Vgpr(vgprs.t_col), stmp)
-                context.v_add_u32(Vgpr(row), Vgpr(row), Vgpr(vgprs.t_row))
-                context.v_mul_lo_u32(Vgpr(row), Vgpr(row), datatype_size(config.a_type))
-                context.v_add_u32(Vgpr(vgprs.t_row), Vgpr(vgprs.t_row), config.wave_group[0] * config.mfma[0])
+                    context.v_add_u32(Vgpr(row), Vgpr(row), Vgpr(vgprs.t_row))
+                    context.v_mul_lo_u32(Vgpr(row), Vgpr(row), datatype_size(config.a_type))
+                    context.s_mov_b32(stmp, config.wave_group[0] * config.mfma[0])
+                    context.v_add_u32(Vgpr(vgprs.t_row), Vgpr(vgprs.t_row), stmp)
 
         context.comment("lds read addresses: thread offsets b")
         context.v_and_b32(Vgpr(vgprs.t_col), config.mfma[1]-1, Vgpr(vgprs.wt_id))
@@ -1441,9 +1446,10 @@ def gemm(
                 with alloc_tmp_sgpr(1) as stmp:
                     context.s_mov_b32(stmp, config.depth_k)
                     context.v_mul_lo_u32(Vgpr(row), Vgpr(vgprs.t_col), stmp)
-                context.v_add_u32(Vgpr(row), Vgpr(row), Vgpr(vgprs.t_row))
-                context.v_mul_lo_u32(Vgpr(row), Vgpr(row), datatype_size(config.b_type))
-                context.v_add_u32(Vgpr(vgprs.t_col), Vgpr(vgprs.t_col), config.wave_group[1] * config.mfma[1])
+                    context.v_add_u32(Vgpr(row), Vgpr(row), Vgpr(vgprs.t_row))
+                    context.v_mul_lo_u32(Vgpr(row), Vgpr(row), datatype_size(config.b_type))
+                    context.s_mov_b32(stmp, config.wave_group[1] * config.mfma[1])
+                    context.v_add_u32(Vgpr(vgprs.t_col), Vgpr(vgprs.t_col), stmp)
 
         context.comment("sync prefetch")
         context.s_waitcnt(lgkmcnt=0)
@@ -1576,21 +1582,24 @@ def gemm(
         for j, col in enumerate(vgprs.gl_offset_d):
             for i, row in enumerate(col):
                 context.comment(f"gw_addr_{i}_{j}")
-                context.v_and_b32(Vgpr(vgprs.t_col), config.mfma[1]-1, Vgpr(vgprs.wt_id))
-                context.v_add_u32(Vgpr(vgprs.t_col), Vgpr(vgprs.t_col), j * config.wave_group[1] * config.mfma[1])
-                context.v_lshrrev_b32(Vgpr(vgprs.t_row), int(math.log2(config.mfma[1])), Vgpr(vgprs.wt_id))
-                context.v_mul_lo_u32(Vgpr(vgprs.t_row), 4, Vgpr(vgprs.t_row))
-                context.v_add_u32(Vgpr(vgprs.t_row), Vgpr(vgprs.t_row), i * config.wave_group[0] * config.mfma[0])
-                context.v_add_i32(Vgpr(vgprs.t_col), Vgpr(vgprs.t_col), Vgpr(vgprs.w_col))
-                context.v_add_i32(Vgpr(vgprs.t_row), Vgpr(vgprs.t_row), Vgpr(vgprs.w_row))
-                context.comment(f"setup voffset_c_{i}_{j}")
-                context.v_mul_lo_u32(Vgpr(vgprs.gl_offset_c[j][i]), Vgpr(vgprs.t_col), Sgpr(sgprs.stride_c_1))
-                context.v_add_u32(Vgpr(vgprs.gl_offset_c[j][i]), Vgpr(vgprs.gl_offset_c[j][i]), Vgpr(vgprs.t_row))
-                context.v_mul_lo_u32(Vgpr(vgprs.gl_offset_c[j][i]), Vgpr(vgprs.gl_offset_c[j][i]), datatype_size(config.cd_type))
-                context.comment(f"setup voffset_d_{i}_{j}")
-                context.v_mul_lo_u32(Vgpr(vgprs.gl_offset_d[j][i]), Vgpr(vgprs.t_col), Sgpr(sgprs.stride_d_1))
-                context.v_add_u32(Vgpr(vgprs.gl_offset_d[j][i]), Vgpr(vgprs.gl_offset_d[j][i]), Vgpr(vgprs.t_row))
-                context.v_mul_lo_u32(Vgpr(vgprs.gl_offset_d[j][i]), Vgpr(vgprs.gl_offset_d[j][i]), datatype_size(config.cd_type))
+                with alloc_tmp_sgpr(1) as stmp:
+                    context.v_and_b32(Vgpr(vgprs.t_col), config.mfma[1]-1, Vgpr(vgprs.wt_id))
+                    context.s_mov_b32(stmp,  j * config.wave_group[1] * config.mfma[1])
+                    context.v_add_u32(Vgpr(vgprs.t_col), Vgpr(vgprs.t_col), stmp)
+                    context.v_lshrrev_b32(Vgpr(vgprs.t_row), int(math.log2(config.mfma[1])), Vgpr(vgprs.wt_id))
+                    context.v_mul_lo_u32(Vgpr(vgprs.t_row), 4, Vgpr(vgprs.t_row))
+                    context.s_mov_b32(stmp, i * config.wave_group[0] * config.mfma[0])
+                    context.v_add_u32(Vgpr(vgprs.t_row), Vgpr(vgprs.t_row), stmp)
+                    context.v_add_i32(Vgpr(vgprs.t_col), Vgpr(vgprs.t_col), Vgpr(vgprs.w_col))
+                    context.v_add_i32(Vgpr(vgprs.t_row), Vgpr(vgprs.t_row), Vgpr(vgprs.w_row))
+                    context.comment(f"setup voffset_c_{i}_{j}")
+                    context.v_mul_lo_u32(Vgpr(vgprs.gl_offset_c[j][i]), Vgpr(vgprs.t_col), Sgpr(sgprs.stride_c_1))
+                    context.v_add_u32(Vgpr(vgprs.gl_offset_c[j][i]), Vgpr(vgprs.gl_offset_c[j][i]), Vgpr(vgprs.t_row))
+                    context.v_mul_lo_u32(Vgpr(vgprs.gl_offset_c[j][i]), Vgpr(vgprs.gl_offset_c[j][i]), datatype_size(config.cd_type))
+                    context.comment(f"setup voffset_d_{i}_{j}")
+                    context.v_mul_lo_u32(Vgpr(vgprs.gl_offset_d[j][i]), Vgpr(vgprs.t_col), Sgpr(sgprs.stride_d_1))
+                    context.v_add_u32(Vgpr(vgprs.gl_offset_d[j][i]), Vgpr(vgprs.gl_offset_d[j][i]), Vgpr(vgprs.t_row))
+                    context.v_mul_lo_u32(Vgpr(vgprs.gl_offset_d[j][i]), Vgpr(vgprs.gl_offset_d[j][i]), datatype_size(config.cd_type))
 
         context.s_mov_b32(Sgpr(sgprs.alpha), Sgpr(sgprs.kern_args+15))
         context.s_mov_b32(Sgpr(sgprs.beta), Sgpr(sgprs.kern_args+16))
@@ -1637,8 +1646,8 @@ gemm_config = GemmSolutionConfig(
     DataType.FP32,
     (16, 16, 1, 4),
     (2, 2),
-    (2, 2),
-    32,
+    (4, 2),
+    16,
     False,
     False,
 )
