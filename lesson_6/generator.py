@@ -912,6 +912,23 @@ def gemm(
         vgpr_counter = 0
         t_id = 0
         vgpr_counter += 1
+        w_id = vgpr_counter
+        vgpr_counter += 1
+        w_row = vgpr_counter
+        vgpr_counter += 1
+        w_col = vgpr_counter
+        vgpr_counter += 1
+        t_row = vgpr_counter
+        vgpr_counter += 1
+        t_col = vgpr_counter
+        vgpr_counter += 1
+        wt_id = vgpr_counter
+        vgpr_counter += 1
+
+        if vgpr_counter % 2:
+            vgpr_counter += 1
+
+        mac_vgpr_start = vgpr_counter
 
         glvw_bytes_a, glvw_bytes_b = config.num_bytes_per_buffer_load
         num_loads_a_0 = max(
@@ -987,6 +1004,9 @@ def gemm(
         print(valu_a)
         print(valu_b)
 
+        #release unused vgprs
+        vgpr_counter = mac_vgpr_start
+
         valu_c = gl_read_data(config.wave_tiling[0], config.wave_tiling[1], 4)
         valu_d = gl_read_data(config.wave_tiling[0], config.wave_tiling[1], 4)
 
@@ -998,19 +1018,6 @@ def gemm(
         gw_voffset_d = gl_read_data(config.wave_tiling[0], config.wave_tiling[1], 4)
 
         valu_acc = gl_read_data(config.wave_tiling[0], config.wave_tiling[1], 4)
-
-        w_id = vgpr_counter
-        vgpr_counter += 1
-        w_row = vgpr_counter
-        vgpr_counter += 1
-        w_col = vgpr_counter
-        vgpr_counter += 1
-        t_row = vgpr_counter
-        vgpr_counter += 1
-        t_col = vgpr_counter
-        vgpr_counter += 1
-        wt_id = vgpr_counter
-        vgpr_counter += 1
 
         return VgprAlloc(
             t_id=t_id,
@@ -1328,7 +1335,8 @@ def gemm(
                     context.comment(f"lw_addr_a_{i}_{j}")
                     context.s_mov_b32(stmp, j * num_load_threads1_a)
                     context.v_add_u32(Vgpr(row), Vgpr(vgprs.t_col), stmp)
-                    context.v_mul_lo_u32(Vgpr(row), Vgpr(row), config.tile_size[0])
+                    context.s_mov_b32(stmp, config.tile_size[0])
+                    context.v_mul_lo_u32(Vgpr(row), Vgpr(row), stmp)
                     context.s_mov_b32(stmp, i * num_load_threads0_a * gl_num_elements_a)
                     context.v_add_u32(Vgpr(row), Vgpr(row), stmp)
                 context.v_add_u32(Vgpr(row), Vgpr(row), Vgpr(vgprs.t_row))
@@ -1349,7 +1357,8 @@ def gemm(
                     context.comment(f"lw_addr_b_{i}_{j}")
                     context.s_mov_b32(stmp, j * num_load_threads1_b)
                     context.v_add_u32(Vgpr(row), Vgpr(vgprs.t_col), stmp)
-                    context.v_mul_lo_u32(Vgpr(row), Vgpr(row), config.depth_k)
+                    context.s_mov_b32(stmp, config.depth_k)
+                    context.v_mul_lo_u32(Vgpr(row), Vgpr(row), stmp)
                     context.s_mov_b32(stmp, i * num_load_threads0_b * gl_num_elements_b)
                     context.v_add_u32(Vgpr(row), Vgpr(row), stmp)
                 context.v_add_u32(Vgpr(row), Vgpr(row), Vgpr(vgprs.t_row))
@@ -1629,7 +1638,7 @@ gemm_config = GemmSolutionConfig(
     (16, 16, 1, 4),
     (2, 2),
     (2, 2),
-    16,
+    32,
     False,
     False,
 )
