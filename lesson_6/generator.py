@@ -32,6 +32,13 @@ class GprRange:
     def __str__(self):
         return f"{self.gpr_type}[{self.index}:{self.index+self.size-1}]"
 
+    def split(self) -> List[Gpr]:
+        if isinstance(self, VgprRange):
+            return [Vgpr(self.index+i) for i in range(self.size)]
+        elif isinstance(self, SgprRange):
+            return [Sgpr(self.index+i) for i in range(self.size)]
+        elif isinstance(self, AccVgprRange):
+            return [AccVgpr(self.index+i) for i in range(self.size)]
 
 class VgprRange(GprRange):
     gpr_type: str = "v"
@@ -174,6 +181,12 @@ class FunctionMeta:
 
         return f".amdgpu_metadata\n---\n{yaml.dump(ret)}\n.end_amdgpu_metadata"
 
+def count_calls(f):
+    def wrapper(*args, **kwargs):
+        wrapper._num_calls += 1
+        return f(*args, **kwargs)
+    wrapper._num_calls = 0
+    return wrapper
 
 def count_gprs(f):
     def wrapper(self, *args, **kwargs):
@@ -461,6 +474,12 @@ class GpuContext:
         )
 
     @count_gprs
+    def s_lshr_b32(self, dst: Sgpr, src: Sgpr, shift: int):
+        self.instructions.append(
+            [lambda: f"s_lshr_b32 {str(dst)}, {str(src)}, {shift}", dst, src, shift]
+        )
+
+    @count_gprs
     def s_mul_i32(self, dst: Sgpr, src0: Sgpr, src1: int | Sgpr):
         self.instructions.append(
             [lambda: f"s_mul_i32 {str(dst)}, {str(src0)}, {str(src1)}", dst, src0, src1]
@@ -470,6 +489,18 @@ class GpuContext:
     def s_add_i32(self, dst: Sgpr, src0: Sgpr, src1: int | Sgpr):
         self.instructions.append(
             [lambda: f"s_add_i32 {str(dst)}, {str(src0)}, {str(src1)}", dst, src0, src1]
+        )
+
+    @count_gprs
+    def s_sub_i32(self, dst: Sgpr, src0: Sgpr, src1: int | Sgpr):
+        self.instructions.append(
+            [lambda: f"s_sub_i32 {str(dst)}, {str(src0)}, {str(src1)}", dst, src0, src1]
+        )
+
+    @count_gprs
+    def s_and_b32(self, dst: Sgpr, src0: Sgpr, src1: int | Sgpr):
+        self.instructions.append(
+            [lambda: f"s_and_b32 {str(dst)}, {str(src0)}, {str(src1)}", dst, src0, src1]
         )
 
     @count_gprs
@@ -500,9 +531,57 @@ class GpuContext:
             ]
         )
 
+    @count_calls
+    @count_gprs
+    def s_div_u32(self, dst: Sgpr, remainder: Sgpr, dividend: Sgpr, divisor: Sgpr):
+        end_label_name = f"s_division_end_{self.s_div_u32._num_calls}"
+        self.s_mov_b32(remainder, 0)
+        self.s_cmp_eq_u32(dividend, divisor)
+        self.s_cselect_b32(dst, 1, 0)
+        self.s_cbranch_scc1(end_label_name)
+        self.s_cmp_lt_u32(dividend, divisor)
+        self.s_cselect_b32(dst, 0, 1)
+        self.s_mov_b32(remainder, divisor)
+        self.s_cbranch_scc1(end_label_name)
+        div_beg_label_name = f"s_division_shift_{self.s_div_u32._num_calls}"
+        div_end_label_name = f"s_division_shift_end_{self.s_div_u32._num_calls}"
+        self.s_mov_b32(remainder, divisor)
+
+        self.label(div_beg_label_name)
+        self.s_cmp_lt_u32(dividend, remainder)
+        self.s_cbranch_scc1(div_end_label_name)
+        self.s_lshl_b32(dst, dst, 1)
+        self.s_lshl_b32(remainder, remainder, 1)
+        self.s_branch(div_beg_label_name)
+        self.label(div_end_label_name)
+
+        div_beg_sub_label_name = f"s_division_sub_{self.s_div_u32._num_calls}"
+        div_end_sub_label_name = f"s_division_sub_end_{self.s_div_u32._num_calls}"
+        self.label(div_beg_sub_label_name)
+        self.s_cmp_le_u32(remainder, dividend)
+        self.s_cbranch_scc1(div_end_sub_label_name)
+        self.s_sub_i32(remainder, remainder, divisor)
+        self.s_sub_i32(dst, dst, 1)
+        self.s_branch(div_beg_sub_label_name)
+        self.label(div_end_sub_label_name)
+        self.s_sub_i32(remainder, dividend, remainder)
+        self.label(end_label_name)
+
     @count_gprs
     def s_cmp_lt_u32(self, lhs: Sgpr | int, rhs: Sgpr | int):
         self.instructions.append([lambda: f"s_cmp_lt_u32 {str(lhs)}, {str(rhs)}", lhs, rhs])
+
+    @count_gprs
+    def s_cmp_le_u32(self, lhs: Sgpr | int, rhs: Sgpr | int):
+        self.instructions.append([lambda: f"s_cmp_le_u32 {str(lhs)}, {str(rhs)}", lhs, rhs])
+
+    @count_gprs
+    def s_cmp_eq_u32(self, lhs: Sgpr | int, rhs: Sgpr | int):
+        self.instructions.append([lambda: f"s_cmp_eq_u32 {str(lhs)}, {str(rhs)}", lhs, rhs])
+
+    @count_gprs
+    def s_cselect_b32(self, dst: Sgpr, lhs: Sgpr | int, rhs: Sgpr | int):
+        self.instructions.append([lambda: f"s_cselect_b32 {str(dst)}, {str(lhs)}, {str(rhs)}", dst, lhs, rhs])
 
     def s_waitcnt(self, vmcnt: int = None, lgkmcnt: int = None):
         assert (vmcnt, lgkmcnt) != (None, None)
@@ -527,6 +606,9 @@ class GpuContext:
 
     def s_cbranch_scc1(self, name: str):
         self.instructions.append([lambda: f"s_cbranch_scc1 {self.label_name(name)}"])
+
+    def s_branch(self, name: str):
+        self.instructions.append([lambda: f"s_branch {self.label_name(name)}"])
 
 
     def s_barrier(self):
@@ -677,7 +759,15 @@ def datatype_size(dtype: DataType):
 
     assert False, "unrecognized type"
 
-
+class GemmOptimizations:
+    def __init__(self, level: int):
+        self.level = level
+        self.wgm = 1
+        self._setup_optimizations()
+        
+    def _setup_optimizations(self):
+        if self.level != 0:
+            self.wgm = 8
 class GemmSolutionConfig:
     def __init__(
         self,
@@ -807,6 +897,7 @@ def gemm(
     name: str,
     arch: str,
     config: GemmSolutionConfig,
+    opt: GemmOptimizations,
     arguments: FunctionArgumentList,
 ) -> str:
     meta = FunctionMeta(name, arguments)
@@ -1127,11 +1218,43 @@ def gemm(
                 )
                 kern_arg_sgpr_offset += 1
                 num_sgpr_kernarg -= 1
+        context.s_waitcnt(lgkmcnt=0)
+
+        # context.label("test_div")
+        # with alloc_tmp_sgpr(4) as stmp:
+        #     s0, s1, s2, s3 = stmp.split()
+        #     context.s_mov_b32(s0, 5)
+        #     context.s_mov_b32(s1, 1)
+        #     context.s_div_u32(s2, s3, s0, s1)
+
+        if opt.wgm > 1:
+            #FIXME: not working correctly
+            context.label("wgm_beg")
+            assert (opt.wgm & opt.wgm - 1) == 0
+            num_workgroups_x, num_workgroups_y = sgprs.kern_args + 17, sgprs.kern_args + 18
+            with alloc_tmp_sgpr(4) as stmps:
+                stmp0, stmp1, stmp2, stmp3 = stmps.split()
+                log_wgm = int(math.log2(opt.wgm))
+                #z = x + y * nwg0
+                context.s_mul_i32(stmp0, Sgpr(sgprs.wg_id_y), Sgpr(num_workgroups_x))
+                context.s_add_i32(stmp0, stmp0, Sgpr(sgprs.wg_id_x))
+                #x = (z % wgm) + z / wgm / nwg1 * wgm
+                #y = (z / wgm) % n
+                context.s_and_b32(Sgpr(sgprs.wg_id_x), stmp0, opt.wgm-1)
+                context.s_lshr_b32(stmp1, stmp0, log_wgm)
+                context.s_div_u32(stmp3, stmp2, stmp1, Sgpr(num_workgroups_y))
+                context.s_mul_i32(stmp3, stmp3, opt.wgm)
+                context.s_add_i32(Sgpr(sgprs.wg_id_x), Sgpr(sgprs.wg_id_x), stmp3)
+                context.comment("wg_id_x")
+                context.s_lshr_b32(Sgpr(sgprs.wg_id_y), stmp0, log_wgm)
+                context.s_div_u32(stmp2, stmp1, Sgpr(sgprs.wg_id_y), Sgpr(num_workgroups_y))
+                context.comment("wg_id_y")
+                context.s_mov_b32(Sgpr(sgprs.wg_id_y), stmp1)
+            context.label("wgm_end")
 
         context.comment("Setup Srd{A, B}")
         context.s_mov_b32(Sgpr(sgprs.srd_a + 3), 0x20000)
         context.s_mov_b32(Sgpr(sgprs.srd_b + 3), 0x20000)
-        context.s_waitcnt(lgkmcnt=0)
         context.s_mov_b64(SgprRange(sgprs.srd_a, 2), SgprRange(sgprs.kern_args, 2))
         context.s_mov_b64(SgprRange(sgprs.srd_b, 2), SgprRange(sgprs.kern_args + 2, 2))
         context.comment("Setup sizes, m, n and k")
@@ -1655,11 +1778,13 @@ print(gemm_config.tile_size, gemm_config.num_workitems)
 print(gemm_config.num_bytes_per_buffer_load)
 
 arch = "gfx90a:xnack-"
+opt = GemmOptimizations(0)
 asm_str = gemm(
     None,
     "gemm",
     arch,
     gemm_config,
+    opt,
     [
         FunctionArgument("global_buffer", "a", None, 8),
         FunctionArgument("global_buffer", "b", None, 8),
@@ -1674,6 +1799,8 @@ asm_str = gemm(
         FunctionArgument("by_value", "ldd", None, 4),
         FunctionArgument("by_value", "alpha", None, 4),
         FunctionArgument("by_value", "beta", None, 4),
+        FunctionArgument("by_value", "numWorkgroupX", None, 4),
+        FunctionArgument("by_value", "numWorkgroupY", None, 4),
     ],
 )
 
