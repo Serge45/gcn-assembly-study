@@ -763,11 +763,12 @@ class GemmOptimizations:
     def __init__(self, level: int):
         self.level = level
         self.wgm = 1
+        self.plr = 0
         self._setup_optimizations()
         
     def _setup_optimizations(self):
         if self.level != 0:
-            self.wgm = 8
+            self.plr = 1
 class GemmSolutionConfig:
     def __init__(
         self,
@@ -950,8 +951,8 @@ def gemm(
         lw_addr_b: List[List[int]]
         lr_addr_a: List[List[int]]
         lr_addr_b: List[List[int]]
-        valu_a: List[List[int]]
-        valu_b: List[List[int]]
+        valu_a: List[List[List[int]]]
+        valu_b: List[List[List[int]]]
         valu_c: List[List[int]]
         valu_d: List[List[int]]
         valu_acc: List[List[int]]
@@ -998,7 +999,7 @@ def gemm(
             end=32 + meta.argument_num_sgpr,
         )
 
-    def vgpr_alloc():
+    def vgpr_alloc(opt: GemmOptimizations):
         # TODO: for non-NN transposes, swap mt0, mt1 if required
         mt0, mt1 = config.tile_size
         depth_k = config.depth_k
@@ -1092,8 +1093,13 @@ def gemm(
         valu_num_vgpr_a = config.num_bytes_per_ds_read[0] // 4
         valu_num_vgpr_b = config.num_bytes_per_ds_read[1] // 4
 
-        valu_a = gl_read_data(config.wave_tiling[0], 1, valu_num_vgpr_a)
-        valu_b = gl_read_data(1, config.wave_tiling[1], valu_num_vgpr_b)
+        valu_a = []
+        for _ in range(opt.plr+1):
+            valu_a.append(gl_read_data(config.wave_tiling[0], 1, valu_num_vgpr_a))
+
+        valu_b = []
+        for _ in range(opt.plr+1):
+            valu_b.append(gl_read_data(1, config.wave_tiling[1], valu_num_vgpr_b))
 
         print("valu{a, b}")
         print(valu_a)
@@ -1300,7 +1306,7 @@ def gemm(
                 for i in range(row, row + agprs.num_reg_per_thread):
                     context.v_accvgpr_write_b32(AccVgpr(i), 0)
 
-        vgprs = vgpr_alloc()
+        vgprs = vgpr_alloc(opt)
         context.label("addr_calculations")
         gl_num_elements_a = config.num_bytes_per_buffer_load[0] // datatype_size(
             config.a_type
@@ -1585,24 +1591,24 @@ def gemm(
 
         unrolled_lr_offset_a, unrolled_lr_offset_b = config.lds_offset_bytes
 
-        def lr_a():
+        def lr_a(k: int):
             nonlocal unrolled_lr_offset_a
-            for j, col in enumerate(vgprs.valu_a):
+            for j, col in enumerate(vgprs.valu_a[k]):
                 for i, row in enumerate(col):
                     context.ds_read_inst(config.num_bytes_per_ds_read[0])(Vgpr(row), Vgpr(vgprs.lr_addr_a[j][i]), unrolled_lr_offset_a)
             unrolled_lr_offset_a += config.mfma[3] * config.tile_size[0] * datatype_size(config.a_type)
 
-        def lr_b():
+        def lr_b(k: int):
             nonlocal unrolled_lr_offset_b
-            for j, col in enumerate(vgprs.valu_b):
+            for j, col in enumerate(vgprs.valu_b[k]):
                 for i, row in enumerate(col):
                     context.ds_read_inst(config.num_bytes_per_ds_read[1])(Vgpr(row), Vgpr(vgprs.lr_addr_b[j][i]), unrolled_lr_offset_b)
             unrolled_lr_offset_b += config.mfma[3] * datatype_size(config.b_type)
 
-        def mfma():
+        def mfma(k: int):
             for j, col in enumerate(agprs.arpgs):
                 for i, row in enumerate(col):
-                    context.mfma_inst(config.mfma)(AccVgprRange(row, 4), Vgpr(vgprs.valu_a[0][i]), Vgpr(vgprs.valu_b[j][0]), AccVgprRange(row, 4))
+                    context.mfma_inst(config.mfma)(AccVgprRange(row, 4), Vgpr(vgprs.valu_a[k][0][i]), Vgpr(vgprs.valu_b[k][j][0]), AccVgprRange(row, 4))
 
         def lw_a():
             for j, col in enumerate(vgprs.lw_addr_a):
@@ -1647,11 +1653,22 @@ def gemm(
                 for i, row in enumerate(col):
                     context.v_add_i32(Vgpr(row), Vgpr(row), Sgpr(sgprs.lds_start_addr))
 
-        for _ in range(config.num_unrolled_iters):
-            lr_a()
-            lr_b()
+        plr_buf_idx = 0
+
+        for u in range(opt.plr):
+            lr_a(plr_buf_idx)
+            lr_b(plr_buf_idx)
+            plr_buf_idx = (plr_buf_idx + 1) % (opt.plr + 1)
+
+        for u in range(config.num_unrolled_iters):
             context.s_waitcnt(lgkmcnt=0)
-            mfma()
+            next_plr_buf_idx = (plr_buf_idx + 1) % (opt.plr + 1)
+            if u + opt.plr < config.num_unrolled_iters:
+                lr_a(plr_buf_idx)
+                lr_b(plr_buf_idx)
+            mfma(u%(opt.plr+1))
+            plr_buf_idx = next_plr_buf_idx
+
         context.comment("ds write")
         context.s_waitcnt(vmcnt=0)
         lw_a()
@@ -1669,17 +1686,27 @@ def gemm(
             context.s_add_i32(Sgpr(sgprs.gl_offset_b), Sgpr(sgprs.gl_offset_b), config.depth_k * datatype_size(config.a_type))
             context.s_add_i32(stmp, Sgpr(sgprs.k_idx), config.depth_k)
             context.s_cmp_lt_u32(stmp, Sgpr(sgprs.k))
-        context.s_cbranch_scc1("outer_loop")
-        context.label("prefetch_last_loop")
-        context.comment("prefetch last loop")
+            context.s_cbranch_scc1("outer_loop")
+            context.label("prefetch_last_loop")
+            context.comment("prefetch last loop")
 
         unrolled_lr_offset_a, unrolled_lr_offset_b = config.lds_offset_bytes
 
-        for _ in range(config.num_unrolled_iters):
-            lr_a()
-            lr_b()
+        plr_buf_idx = 0
+
+        for u in range(opt.plr):
+            lr_a(plr_buf_idx)
+            lr_b(plr_buf_idx)
+            plr_buf_idx = (plr_buf_idx + 1) % (opt.plr + 1)
+
+        for u in range(config.num_unrolled_iters):
             context.s_waitcnt(lgkmcnt=0)
-            mfma()
+            next_plr_buf_idx = (plr_buf_idx + 1) % (opt.plr + 1)
+            if u + opt.plr < config.num_unrolled_iters:
+                lr_a(plr_buf_idx)
+                lr_b(plr_buf_idx)
+            mfma(u%(opt.plr+1))
+            plr_buf_idx = next_plr_buf_idx
 
         context.comment("setup srd{c, d}")
         context.s_mov_b64(SgprRange(sgprs.srd_c, 2), SgprRange(sgprs.kern_args+4, 2))
@@ -1778,7 +1805,8 @@ print(gemm_config.tile_size, gemm_config.num_workitems)
 print(gemm_config.num_bytes_per_buffer_load)
 
 arch = "gfx90a:xnack-"
-opt = GemmOptimizations(0)
+opt = GemmOptimizations(1)
+opt.plr = 1
 asm_str = gemm(
     None,
     "gemm",
