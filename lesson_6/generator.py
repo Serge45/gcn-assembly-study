@@ -1762,6 +1762,36 @@ def gemm(
                         Vgpr(row), vdata, config.lds_offset_bytes[1]
                     )
 
+        def lw_a_gen():
+            for j, col in enumerate(vgprs.lw_addr_a):
+                for i, row in enumerate(col):
+                    vdata = (
+                        VgprRange(
+                            vgprs.gl_data_a[j][i],
+                            config.num_bytes_per_buffer_load[0] // 4,
+                        )
+                        if config.num_bytes_per_buffer_load[0] > 4
+                        else Vgpr(vgprs.gl_data_a[j][i])
+                    )
+                    yield lambda: context.ds_write_inst(
+                        config.num_bytes_per_buffer_load[0]
+                    )(Vgpr(row), vdata, config.lds_offset_bytes[0])
+
+        def lw_b_gen():
+            for j, col in enumerate(vgprs.lw_addr_b):
+                for i, row in enumerate(col):
+                    vdata = (
+                        VgprRange(
+                            vgprs.gl_data_b[j][i],
+                            config.num_bytes_per_buffer_load[1] // 4,
+                        )
+                        if config.num_bytes_per_buffer_load[1] > 4
+                        else Vgpr(vgprs.gl_data_b[j][i])
+                    )
+                    yield lambda: context.ds_write_inst(
+                        config.num_bytes_per_buffer_load[1]
+                    )(Vgpr(row), vdata, config.lds_offset_bytes[1])
+
         def swap_lds_addr():
             for j, col in enumerate(vgprs.lr_addr_a):
                 for i, row in enumerate(col):
@@ -1798,8 +1828,22 @@ def gemm(
                         if inst:
                             inst()
                 else:
-                    mfma(u % (opt.plr + 1))
+                    if config.num_unrolled_iters - u == opt.plr:
+                        context.s_waitcnt(vmcnt=0)
+
+                    for inst in roundrobin(
+                        mfma_iter,
+                        lw_a_gen(),
+                        mfma_iter,
+                        lw_b_gen(),
+                        mfma_iter,
+                    ):
+                        if inst:
+                            inst()
                 plr_buf_idx = next_plr_buf_idx
+            swap_lds_addr()
+            context.s_waitcnt(lgkmcnt=0)
+            context.s_barrier()
         elif opt.plr:
             for u in range(config.num_unrolled_iters):
                 context.s_waitcnt(lgkmcnt=0)
@@ -1818,15 +1862,16 @@ def gemm(
                 next_plr_buf_idx = (plr_buf_idx + 1) % (opt.plr + 1)
                 plr_buf_idx = next_plr_buf_idx
 
-        context.comment("ds write")
-        context.s_waitcnt(vmcnt=0)
-        lw_a()
-        lw_b()
-        context.comment("swap lds")
-        swap_lds_addr()
-        context.comment("wait for ds writes")
-        context.s_waitcnt(lgkmcnt=0)
-        context.s_barrier()
+        if opt.level == 0:
+            context.comment("ds write")
+            context.s_waitcnt(vmcnt=0)
+            lw_a()
+            lw_b()
+            context.comment("swap lds")
+            swap_lds_addr()
+            context.comment("wait for ds writes")
+            context.s_waitcnt(lgkmcnt=0)
+            context.s_barrier()
 
         with alloc_tmp_sgpr(1) as stmp:
             context.s_add_i32(Sgpr(sgprs.k_idx), Sgpr(sgprs.k_idx), config.depth_k)
@@ -1860,8 +1905,8 @@ def gemm(
             for u in range(config.num_unrolled_iters):
                 context.s_waitcnt(lgkmcnt=0)
                 next_plr_buf_idx = (plr_buf_idx + 1) % (opt.plr + 1)
+                mfma_iter = mfma_gen(u % (opt.plr + 1))
                 if u + opt.plr < config.num_unrolled_iters:
-                    mfma_iter = mfma_gen(u % (opt.plr + 1))
                     for inst in roundrobin(
                         mfma_iter,
                         lr_a_gen(plr_buf_idx),
@@ -1871,7 +1916,11 @@ def gemm(
                         if inst:
                             inst()
                 else:
-                    mfma(u % (opt.plr + 1))
+                    for inst in roundrobin(
+                        mfma_iter,
+                    ):
+                        if inst:
+                            inst()
                 plr_buf_idx = next_plr_buf_idx
         elif opt.plr:
             for u in range(config.num_unrolled_iters):
@@ -2052,7 +2101,7 @@ gemm_config = GemmSolutionConfig(
     DataType.FP32,
     (16, 16, 1, 4),
     (2, 2),
-    (4, 2),
+    (2, 2),
     16,
     False,
     False,
@@ -2062,7 +2111,9 @@ print(gemm_config.num_bytes_per_buffer_load)
 
 ap = argparse.ArgumentParser()
 ap.add_argument(dest="output_folder", action="store", type=str, help="Output folder")
-ap.add_argument("--arch", dest="arch", action="store", choices=["gfx90a", "gfx90a:xnack-", "gfx942"])
+ap.add_argument(
+    "--arch", dest="arch", action="store", choices=["gfx90a", "gfx90a:xnack-", "gfx942"]
+)
 args = ap.parse_args()
 
 arch = args.arch
