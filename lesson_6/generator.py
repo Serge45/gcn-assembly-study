@@ -1,19 +1,22 @@
 from typing import Optional, List, Tuple, Dict
 from contextlib import contextmanager
-import yaml
 from io import StringIO
 from enum import IntEnum
 import subprocess
-import tomli_w
 from dataclasses import dataclass
 import math
 from itertools import cycle, islice
+import argparse
+import yaml
+import tomli_w
+
 
 def roundrobin(*iterables):
     iterators = map(iter, iterables)
     for num_active in range(len(iterables), 0, -1):
         iterators = cycle(islice(iterators, num_active))
         yield from map(next, iterators)
+
 
 DEFAULT_CLANG_PATH = "/opt/rocm/llvm/bin/clang++"
 MAX_LDS_NUM_BYTES = 65536
@@ -41,11 +44,12 @@ class GprRange:
 
     def split(self) -> List[Gpr]:
         if isinstance(self, VgprRange):
-            return [Vgpr(self.index+i) for i in range(self.size)]
+            return [Vgpr(self.index + i) for i in range(self.size)]
         elif isinstance(self, SgprRange):
-            return [Sgpr(self.index+i) for i in range(self.size)]
+            return [Sgpr(self.index + i) for i in range(self.size)]
         elif isinstance(self, AccVgprRange):
-            return [AccVgpr(self.index+i) for i in range(self.size)]
+            return [AccVgpr(self.index + i) for i in range(self.size)]
+
 
 class VgprRange(GprRange):
     gpr_type: str = "v"
@@ -188,12 +192,15 @@ class FunctionMeta:
 
         return f".amdgpu_metadata\n---\n{yaml.dump(ret)}\n.end_amdgpu_metadata"
 
+
 def count_calls(f):
     def wrapper(*args, **kwargs):
         wrapper._num_calls += 1
         return f(*args, **kwargs)
+
     wrapper._num_calls = 0
     return wrapper
+
 
 def count_gprs(f):
     def wrapper(self, *args, **kwargs):
@@ -576,19 +583,27 @@ class GpuContext:
 
     @count_gprs
     def s_cmp_lt_u32(self, lhs: Sgpr | int, rhs: Sgpr | int):
-        self.instructions.append([lambda: f"s_cmp_lt_u32 {str(lhs)}, {str(rhs)}", lhs, rhs])
+        self.instructions.append(
+            [lambda: f"s_cmp_lt_u32 {str(lhs)}, {str(rhs)}", lhs, rhs]
+        )
 
     @count_gprs
     def s_cmp_le_u32(self, lhs: Sgpr | int, rhs: Sgpr | int):
-        self.instructions.append([lambda: f"s_cmp_le_u32 {str(lhs)}, {str(rhs)}", lhs, rhs])
+        self.instructions.append(
+            [lambda: f"s_cmp_le_u32 {str(lhs)}, {str(rhs)}", lhs, rhs]
+        )
 
     @count_gprs
     def s_cmp_eq_u32(self, lhs: Sgpr | int, rhs: Sgpr | int):
-        self.instructions.append([lambda: f"s_cmp_eq_u32 {str(lhs)}, {str(rhs)}", lhs, rhs])
+        self.instructions.append(
+            [lambda: f"s_cmp_eq_u32 {str(lhs)}, {str(rhs)}", lhs, rhs]
+        )
 
     @count_gprs
     def s_cselect_b32(self, dst: Sgpr, lhs: Sgpr | int, rhs: Sgpr | int):
-        self.instructions.append([lambda: f"s_cselect_b32 {str(dst)}, {str(lhs)}, {str(rhs)}", dst, lhs, rhs])
+        self.instructions.append(
+            [lambda: f"s_cselect_b32 {str(dst)}, {str(lhs)}, {str(rhs)}", dst, lhs, rhs]
+        )
 
     def s_waitcnt(self, vmcnt: int = None, lgkmcnt: int = None):
         assert (vmcnt, lgkmcnt) != (None, None)
@@ -617,7 +632,6 @@ class GpuContext:
     def s_branch(self, name: str):
         self.instructions.append([lambda: f"s_branch {self.label_name(name)}"])
 
-
     def s_barrier(self):
         self.instructions.append([lambda: "s_barrier"])
 
@@ -639,17 +653,13 @@ class GpuContext:
         )
 
     @count_gprs
-    def v_add_u32(
-        self, dst: Vgpr, src0: Vgpr | int, src1: Sgpr | Vgpr | int
-    ):
+    def v_add_u32(self, dst: Vgpr, src0: Vgpr | int, src1: Sgpr | Vgpr | int):
         self.instructions.append(
             [lambda: f"v_add_u32 {str(dst)}, {str(src0)}, {str(src1)}", dst, src0, src1]
         )
 
     @count_gprs
-    def v_add_i32(
-        self, dst: Vgpr, src0: Vgpr | int, src1: Sgpr | Vgpr | int
-    ):
+    def v_add_i32(self, dst: Vgpr, src0: Vgpr | int, src1: Sgpr | Vgpr | int):
         self.instructions.append(
             [lambda: f"v_add_i32 {str(dst)}, {str(src0)}, {str(src1)}", dst, src0, src1]
         )
@@ -703,7 +713,13 @@ class GpuContext:
         )
 
     @count_gprs
-    def v_fma_f32(self, dst: Vgpr, src0: Vgpr | float, src1: Sgpr | Vgpr | float, src2: Sgpr | Vgpr | float):
+    def v_fma_f32(
+        self,
+        dst: Vgpr,
+        src0: Vgpr | float,
+        src1: Sgpr | Vgpr | float,
+        src2: Sgpr | Vgpr | float,
+    ):
         self.instructions.append(
             [
                 lambda: f"v_fma_f32 {str(dst)}, {str(src0)}, {str(src1)}, {str(src2)}",
@@ -733,9 +749,17 @@ class GpuContext:
         )
 
     @count_gprs
-    def v_mfma_f32_16x16x4f32(self, acc: AccVgprRange, a: Vgpr, b: Vgpr, c: AccVgprRange):
+    def v_mfma_f32_16x16x4f32(
+        self, acc: AccVgprRange, a: Vgpr, b: Vgpr, c: AccVgprRange
+    ):
         self.instructions.append(
-            [lambda: f"v_mfma_f32_16x16x4f32 {str(acc)}, {str(a)}, {str(b)}, {str(c)}", acc, a, b, c]
+            [
+                lambda: f"v_mfma_f32_16x16x4f32 {str(acc)}, {str(a)}, {str(b)}, {str(c)}",
+                acc,
+                a,
+                b,
+                c,
+            ]
         )
 
     def mfma_inst(self, mfma: Tuple[int, int, int, int]):
@@ -766,16 +790,19 @@ def datatype_size(dtype: DataType):
 
     assert False, "unrecognized type"
 
+
 class GemmOptimizations:
     def __init__(self, level: int):
         self.level = level
         self.wgm = 1
         self.plr = 0
         self._setup_optimizations()
-        
+
     def _setup_optimizations(self):
         if self.level != 0:
             self.plr = 1
+
+
 class GemmSolutionConfig:
     def __init__(
         self,
@@ -804,9 +831,13 @@ class GemmSolutionConfig:
         self.name = None
 
         if self.lds_usage_bytes >= MAX_LDS_NUM_BYTES:
-            raise RuntimeError(f"LDS usage exceeds {MAX_LDS_NUM_BYTES}: {self.lds_usage_bytes}")
+            raise RuntimeError(
+                f"LDS usage exceeds {MAX_LDS_NUM_BYTES}: {self.lds_usage_bytes}"
+            )
 
-        assert all((wave_group[i] & (wave_group[i] - 1)) == 0 for i in range(len(wave_group)))
+        assert all(
+            (wave_group[i] & (wave_group[i] - 1)) == 0 for i in range(len(wave_group))
+        )
 
     @property
     def tile_size(self) -> Tuple[int, int]:
@@ -884,7 +915,7 @@ class GemmSolutionConfig:
             "wave_tiling": self.wave_tiling,
             "depth_k": self.depth_k,
             "wavefront_size": self.wavefront_size,
-            "name": self.name if self.name else ""
+            "name": self.name if self.name else "",
         }
 
     def from_dict(self, d):
@@ -901,6 +932,7 @@ class GemmSolutionConfig:
         self.wavefront_size = d["wavefront_size"]
         self.name = d["name"]
 
+
 @gpu_function
 def gemm(
     context: GpuContext,
@@ -912,7 +944,9 @@ def gemm(
 ) -> str:
     meta = FunctionMeta(name, arguments)
     meta.group_segment_fixed_size = config.lds_usage_bytes
-    meta.workgroup_size = config.wave_group[0] * config.wave_group[1] * meta.wavefront_size
+    meta.workgroup_size = (
+        config.wave_group[0] * config.wave_group[1] * meta.wavefront_size
+    )
 
     @dataclass
     class SgprAlloc:
@@ -1103,18 +1137,18 @@ def gemm(
         valu_num_vgpr_b = config.num_bytes_per_ds_read[1] // 4
 
         valu_a = []
-        for _ in range(opt.plr+1):
+        for _ in range(opt.plr + 1):
             valu_a.append(gl_read_data(config.wave_tiling[0], 1, valu_num_vgpr_a))
 
         valu_b = []
-        for _ in range(opt.plr+1):
+        for _ in range(opt.plr + 1):
             valu_b.append(gl_read_data(1, config.wave_tiling[1], valu_num_vgpr_b))
 
         print("valu{a, b}")
         print(valu_a)
         print(valu_b)
 
-        #release unused vgprs
+        # release unused vgprs
         vgpr_counter = mac_vgpr_start
 
         valu_c = gl_read_data(config.wave_tiling[0], config.wave_tiling[1], 4)
@@ -1151,7 +1185,7 @@ def gemm(
             w_id=w_id,
             w_row=w_row,
             w_col=w_col,
-            wt_id=wt_id
+            wt_id=wt_id,
         )
 
     def agpr_alloc():
@@ -1243,26 +1277,31 @@ def gemm(
         #     context.s_div_u32(s2, s3, s0, s1)
 
         if opt.wgm > 1:
-            #FIXME: not working correctly
+            # FIXME: not working correctly
             context.label("wgm_beg")
             assert (opt.wgm & opt.wgm - 1) == 0
-            num_workgroups_x, num_workgroups_y = sgprs.kern_args + 17, sgprs.kern_args + 18
+            num_workgroups_x, num_workgroups_y = (
+                sgprs.kern_args + 17,
+                sgprs.kern_args + 18,
+            )
             with alloc_tmp_sgpr(4) as stmps:
                 stmp0, stmp1, stmp2, stmp3 = stmps.split()
                 log_wgm = int(math.log2(opt.wgm))
-                #z = x + y * nwg0
+                # z = x + y * nwg0
                 context.s_mul_i32(stmp0, Sgpr(sgprs.wg_id_y), Sgpr(num_workgroups_x))
                 context.s_add_i32(stmp0, stmp0, Sgpr(sgprs.wg_id_x))
-                #x = (z % wgm) + z / wgm / nwg1 * wgm
-                #y = (z / wgm) % n
-                context.s_and_b32(Sgpr(sgprs.wg_id_x), stmp0, opt.wgm-1)
+                # x = (z % wgm) + z / wgm / nwg1 * wgm
+                # y = (z / wgm) % n
+                context.s_and_b32(Sgpr(sgprs.wg_id_x), stmp0, opt.wgm - 1)
                 context.s_lshr_b32(stmp1, stmp0, log_wgm)
                 context.s_div_u32(stmp3, stmp2, stmp1, Sgpr(num_workgroups_y))
                 context.s_mul_i32(stmp3, stmp3, opt.wgm)
                 context.s_add_i32(Sgpr(sgprs.wg_id_x), Sgpr(sgprs.wg_id_x), stmp3)
                 context.comment("wg_id_x")
                 context.s_lshr_b32(Sgpr(sgprs.wg_id_y), stmp0, log_wgm)
-                context.s_div_u32(stmp2, stmp1, Sgpr(sgprs.wg_id_y), Sgpr(num_workgroups_y))
+                context.s_div_u32(
+                    stmp2, stmp1, Sgpr(sgprs.wg_id_y), Sgpr(num_workgroups_y)
+                )
                 context.comment("wg_id_y")
                 context.s_mov_b32(Sgpr(sgprs.wg_id_y), stmp1)
             context.label("wgm_end")
@@ -1287,8 +1326,16 @@ def gemm(
 
         context.label("setup_gl_offsets")
         context.comment("Setup global read offsets")
-        context.s_lshl_b32(Sgpr(sgprs.row_idx), Sgpr(sgprs.wg_id_x), int(math.log2(config.tile_size[0])))
-        context.s_lshl_b32(Sgpr(sgprs.col_idx), Sgpr(sgprs.wg_id_y), int(math.log2(config.tile_size[1])))
+        context.s_lshl_b32(
+            Sgpr(sgprs.row_idx),
+            Sgpr(sgprs.wg_id_x),
+            int(math.log2(config.tile_size[0])),
+        )
+        context.s_lshl_b32(
+            Sgpr(sgprs.col_idx),
+            Sgpr(sgprs.wg_id_y),
+            int(math.log2(config.tile_size[1])),
+        )
 
         bpe_log_a = int(math.log2(datatype_size(gemm_config.a_type)))
         bpe_log_b = int(math.log2(datatype_size(gemm_config.b_type)))
@@ -1337,7 +1384,9 @@ def gemm(
                 with alloc_tmp_sgpr(1) as stmp:
                     context.comment(f"gl_addr_a_{i}_{j}")
                     context.s_mov_b32(stmp, j * num_load_threads1_a)
-                    context.v_add_u32(Vgpr(vgprs.gl_offset_a[j][i]), Vgpr(vgprs.t_col), stmp)
+                    context.v_add_u32(
+                        Vgpr(vgprs.gl_offset_a[j][i]), Vgpr(vgprs.t_col), stmp
+                    )
                     context.v_mul_lo_u32(
                         Vgpr(vgprs.gl_offset_a[j][i]),
                         Vgpr(vgprs.gl_offset_a[j][i]),
@@ -1349,7 +1398,11 @@ def gemm(
                         Vgpr(vgprs.t_row),
                     )
                     context.s_mov_b32(stmp, i * num_load_threads0_a * gl_num_elements_a)
-                    context.v_add_u32(Vgpr(vgprs.gl_offset_a[j][i]), Vgpr(vgprs.gl_offset_a[j][i]), stmp)
+                    context.v_add_u32(
+                        Vgpr(vgprs.gl_offset_a[j][i]),
+                        Vgpr(vgprs.gl_offset_a[j][i]),
+                        stmp,
+                    )
                     context.v_mul_lo_u32(
                         Vgpr(vgprs.gl_offset_a[j][i]),
                         datatype_size(config.a_type),
@@ -1374,7 +1427,9 @@ def gemm(
                 with alloc_tmp_sgpr(1) as stmp:
                     context.comment(f"gl_addr_b_{i}_{j}")
                     context.s_mov_b32(stmp, j * num_load_threads1_b)
-                    context.v_add_u32(Vgpr(vgprs.gl_offset_b[j][i]), Vgpr(vgprs.t_col), stmp)
+                    context.v_add_u32(
+                        Vgpr(vgprs.gl_offset_b[j][i]), Vgpr(vgprs.t_col), stmp
+                    )
                     context.v_mul_lo_u32(
                         Vgpr(vgprs.gl_offset_b[j][i]),
                         Vgpr(vgprs.gl_offset_b[j][i]),
@@ -1386,7 +1441,11 @@ def gemm(
                         Vgpr(vgprs.t_row),
                     )
                     context.s_mov_b32(stmp, i * num_load_threads0_b * gl_num_elements_b)
-                    context.v_add_u32(Vgpr(vgprs.gl_offset_b[j][i]), Vgpr(vgprs.gl_offset_b[j][i]), stmp)
+                    context.v_add_u32(
+                        Vgpr(vgprs.gl_offset_b[j][i]),
+                        Vgpr(vgprs.gl_offset_b[j][i]),
+                        stmp,
+                    )
                     context.v_mul_lo_u32(
                         Vgpr(vgprs.gl_offset_b[j][i]),
                         Vgpr(vgprs.gl_offset_b[j][i]),
@@ -1436,9 +1495,19 @@ def gemm(
         def gl_increments():
             with alloc_tmp_sgpr(1) as stmp:
                 context.comment("gl_offset increments for unrolled loop")
-                context.s_mul_i32(stmp, Sgpr(sgprs.stride_a_1), config.depth_k * datatype_size(config.a_type))
-                context.s_add_i32(Sgpr(sgprs.gl_offset_a), Sgpr(sgprs.gl_offset_a), stmp)
-                context.s_add_i32(Sgpr(sgprs.gl_offset_b), Sgpr(sgprs.gl_offset_b), config.depth_k * datatype_size(config.b_type))
+                context.s_mul_i32(
+                    stmp,
+                    Sgpr(sgprs.stride_a_1),
+                    config.depth_k * datatype_size(config.a_type),
+                )
+                context.s_add_i32(
+                    Sgpr(sgprs.gl_offset_a), Sgpr(sgprs.gl_offset_a), stmp
+                )
+                context.s_add_i32(
+                    Sgpr(sgprs.gl_offset_b),
+                    Sgpr(sgprs.gl_offset_b),
+                    config.depth_k * datatype_size(config.b_type),
+                )
 
         gl_a()
         gl_b()
@@ -1535,16 +1604,22 @@ def gemm(
         context.label("lds_wave_offsets")
         context.comment("lds read addresses: wave offsets")
         context.v_lshrrev_b32(Vgpr(vgprs.w_id), 6, Vgpr(vgprs.t_id))
-        context.v_and_b32(Vgpr(vgprs.wt_id), config.wavefront_size-1, Vgpr(vgprs.t_id))
-        context.v_lshrrev_b32(Vgpr(vgprs.w_col), int(math.log2(config.wave_group[0])), Vgpr(vgprs.w_id))
+        context.v_and_b32(
+            Vgpr(vgprs.wt_id), config.wavefront_size - 1, Vgpr(vgprs.t_id)
+        )
+        context.v_lshrrev_b32(
+            Vgpr(vgprs.w_col), int(math.log2(config.wave_group[0])), Vgpr(vgprs.w_id)
+        )
         context.v_mul_lo_u32(Vgpr(vgprs.w_col), Vgpr(vgprs.w_col), config.mfma[1])
-        context.v_and_b32(Vgpr(vgprs.w_row), config.wave_group[0]-1, Vgpr(vgprs.w_id))
+        context.v_and_b32(Vgpr(vgprs.w_row), config.wave_group[0] - 1, Vgpr(vgprs.w_id))
         context.v_mul_lo_u32(Vgpr(vgprs.w_row), Vgpr(vgprs.w_row), config.mfma[0])
 
         context.comment("lds read addresses: thread offsets a")
-        context.v_and_b32(Vgpr(vgprs.t_row), config.mfma[0]-1, Vgpr(vgprs.wt_id))
-        context.v_lshrrev_b32(Vgpr(vgprs.t_col), int(math.log2(config.mfma[0])), Vgpr(vgprs.wt_id))
-        #TODO: multiply num_reg_per_thread_mfma_a for other MFMA
+        context.v_and_b32(Vgpr(vgprs.t_row), config.mfma[0] - 1, Vgpr(vgprs.wt_id))
+        context.v_lshrrev_b32(
+            Vgpr(vgprs.t_col), int(math.log2(config.mfma[0])), Vgpr(vgprs.wt_id)
+        )
+        # TODO: multiply num_reg_per_thread_mfma_a for other MFMA
         context.v_add_u32(Vgpr(vgprs.t_row), Vgpr(vgprs.t_row), Vgpr(vgprs.w_row))
 
         for j, col in enumerate(vgprs.lr_addr_a):
@@ -1553,14 +1628,18 @@ def gemm(
                     context.s_mov_b32(stmp, config.tile_size[0])
                     context.v_mul_lo_u32(Vgpr(row), Vgpr(vgprs.t_col), stmp)
                     context.v_add_u32(Vgpr(row), Vgpr(row), Vgpr(vgprs.t_row))
-                    context.v_mul_lo_u32(Vgpr(row), Vgpr(row), datatype_size(config.a_type))
+                    context.v_mul_lo_u32(
+                        Vgpr(row), Vgpr(row), datatype_size(config.a_type)
+                    )
                     context.s_mov_b32(stmp, config.wave_group[0] * config.mfma[0])
                     context.v_add_u32(Vgpr(vgprs.t_row), Vgpr(vgprs.t_row), stmp)
 
         context.comment("lds read addresses: thread offsets b")
-        context.v_and_b32(Vgpr(vgprs.t_col), config.mfma[1]-1, Vgpr(vgprs.wt_id))
-        context.v_lshrrev_b32(Vgpr(vgprs.t_row), int(math.log2(config.mfma[1])), Vgpr(vgprs.wt_id))
-        #TODO: multiply num_reg_per_thread_mfma_b for other MFMA
+        context.v_and_b32(Vgpr(vgprs.t_col), config.mfma[1] - 1, Vgpr(vgprs.wt_id))
+        context.v_lshrrev_b32(
+            Vgpr(vgprs.t_row), int(math.log2(config.mfma[1])), Vgpr(vgprs.wt_id)
+        )
+        # TODO: multiply num_reg_per_thread_mfma_b for other MFMA
         context.v_add_u32(Vgpr(vgprs.t_col), Vgpr(vgprs.t_col), Vgpr(vgprs.w_col))
 
         for j, col in enumerate(vgprs.lr_addr_b):
@@ -1569,7 +1648,9 @@ def gemm(
                     context.s_mov_b32(stmp, config.depth_k)
                     context.v_mul_lo_u32(Vgpr(row), Vgpr(vgprs.t_col), stmp)
                     context.v_add_u32(Vgpr(row), Vgpr(row), Vgpr(vgprs.t_row))
-                    context.v_mul_lo_u32(Vgpr(row), Vgpr(row), datatype_size(config.b_type))
+                    context.v_mul_lo_u32(
+                        Vgpr(row), Vgpr(row), datatype_size(config.b_type)
+                    )
                     context.s_mov_b32(stmp, config.wave_group[1] * config.mfma[1])
                     context.v_add_u32(Vgpr(vgprs.t_col), Vgpr(vgprs.t_col), stmp)
 
@@ -1583,14 +1664,20 @@ def gemm(
             nonlocal unrolled_lr_offset_a
             for j, col in enumerate(vgprs.valu_a[k]):
                 for i, row in enumerate(col):
-                    context.ds_read_inst(config.num_bytes_per_ds_read[0])(Vgpr(row), Vgpr(vgprs.lr_addr_a[j][i]), unrolled_lr_offset_a)
-            unrolled_lr_offset_a += config.mfma[3] * config.tile_size[0] * datatype_size(config.a_type)
+                    context.ds_read_inst(config.num_bytes_per_ds_read[0])(
+                        Vgpr(row), Vgpr(vgprs.lr_addr_a[j][i]), unrolled_lr_offset_a
+                    )
+            unrolled_lr_offset_a += (
+                config.mfma[3] * config.tile_size[0] * datatype_size(config.a_type)
+            )
 
         def lr_b(k: int):
             nonlocal unrolled_lr_offset_b
             for j, col in enumerate(vgprs.valu_b[k]):
                 for i, row in enumerate(col):
-                    context.ds_read_inst(config.num_bytes_per_ds_read[1])(Vgpr(row), Vgpr(vgprs.lr_addr_b[j][i]), unrolled_lr_offset_b)
+                    context.ds_read_inst(config.num_bytes_per_ds_read[1])(
+                        Vgpr(row), Vgpr(vgprs.lr_addr_b[j][i]), unrolled_lr_offset_b
+                    )
             unrolled_lr_offset_b += config.mfma[3] * datatype_size(config.b_type)
 
         context.label("outer_loop")
@@ -1608,50 +1695,72 @@ def gemm(
         def mfma(k: int):
             for j, col in enumerate(agprs.arpgs):
                 for i, row in enumerate(col):
-                    context.mfma_inst(config.mfma)(AccVgprRange(row, 4), Vgpr(vgprs.valu_a[k][0][i]), Vgpr(vgprs.valu_b[k][j][0]), AccVgprRange(row, 4))
+                    context.mfma_inst(config.mfma)(
+                        AccVgprRange(row, 4),
+                        Vgpr(vgprs.valu_a[k][0][i]),
+                        Vgpr(vgprs.valu_b[k][j][0]),
+                        AccVgprRange(row, 4),
+                    )
 
         def lr_a_gen(k: int):
             nonlocal unrolled_lr_offset_a
             for j, col in enumerate(vgprs.valu_a[k]):
                 for i, row in enumerate(col):
-                    yield lambda: context.ds_read_inst(config.num_bytes_per_ds_read[0])(Vgpr(row), Vgpr(vgprs.lr_addr_a[j][i]), unrolled_lr_offset_a)
-            unrolled_lr_offset_a += config.mfma[3] * config.tile_size[0] * datatype_size(config.a_type)
+                    yield lambda: context.ds_read_inst(config.num_bytes_per_ds_read[0])(
+                        Vgpr(row), Vgpr(vgprs.lr_addr_a[j][i]), unrolled_lr_offset_a
+                    )
+            unrolled_lr_offset_a += (
+                config.mfma[3] * config.tile_size[0] * datatype_size(config.a_type)
+            )
 
         def lr_b_gen(k: int):
             nonlocal unrolled_lr_offset_b
             for j, col in enumerate(vgprs.valu_b[k]):
                 for i, row in enumerate(col):
-                    yield context.ds_read_inst(config.num_bytes_per_ds_read[1])(Vgpr(row), Vgpr(vgprs.lr_addr_b[j][i]), unrolled_lr_offset_b)
+                    yield context.ds_read_inst(config.num_bytes_per_ds_read[1])(
+                        Vgpr(row), Vgpr(vgprs.lr_addr_b[j][i]), unrolled_lr_offset_b
+                    )
             unrolled_lr_offset_b += config.mfma[3] * datatype_size(config.b_type)
 
         def mfma_gen(k):
             for j, col in enumerate(agprs.arpgs):
                 for i, row in enumerate(col):
-                    yield lambda: context.mfma_inst(config.mfma)(AccVgprRange(row, 4), Vgpr(vgprs.valu_a[k][0][i]), Vgpr(vgprs.valu_b[k][j][0]), AccVgprRange(row, 4))
+                    yield lambda: context.mfma_inst(config.mfma)(
+                        AccVgprRange(row, 4),
+                        Vgpr(vgprs.valu_a[k][0][i]),
+                        Vgpr(vgprs.valu_b[k][j][0]),
+                        AccVgprRange(row, 4),
+                    )
 
         def lw_a():
             for j, col in enumerate(vgprs.lw_addr_a):
                 for i, row in enumerate(col):
                     vdata = (
                         VgprRange(
-                            vgprs.gl_data_a[j][i], config.num_bytes_per_buffer_load[0] // 4
+                            vgprs.gl_data_a[j][i],
+                            config.num_bytes_per_buffer_load[0] // 4,
                         )
                         if config.num_bytes_per_buffer_load[0] > 4
-                            else Vgpr(vgprs.gl_data_a[j][i])
-                        )
-                    context.ds_write_inst(config.num_bytes_per_buffer_load[0])(Vgpr(row), vdata, config.lds_offset_bytes[0])
+                        else Vgpr(vgprs.gl_data_a[j][i])
+                    )
+                    context.ds_write_inst(config.num_bytes_per_buffer_load[0])(
+                        Vgpr(row), vdata, config.lds_offset_bytes[0]
+                    )
 
         def lw_b():
             for j, col in enumerate(vgprs.lw_addr_b):
                 for i, row in enumerate(col):
                     vdata = (
                         VgprRange(
-                            vgprs.gl_data_b[j][i], config.num_bytes_per_buffer_load[1] // 4
+                            vgprs.gl_data_b[j][i],
+                            config.num_bytes_per_buffer_load[1] // 4,
                         )
                         if config.num_bytes_per_buffer_load[1] > 4
-                            else Vgpr(vgprs.gl_data_b[j][i])
-                        )
-                    context.ds_write_inst(config.num_bytes_per_buffer_load[1])(Vgpr(row), vdata, config.lds_offset_bytes[1])
+                        else Vgpr(vgprs.gl_data_b[j][i])
+                    )
+                    context.ds_write_inst(config.num_bytes_per_buffer_load[1])(
+                        Vgpr(row), vdata, config.lds_offset_bytes[1]
+                    )
 
         def swap_lds_addr():
             for j, col in enumerate(vgprs.lr_addr_a):
@@ -1662,7 +1771,9 @@ def gemm(
                 for i, row in enumerate(col):
                     context.v_add_i32(Vgpr(row), Vgpr(row), Sgpr(sgprs.lds_start_addr))
 
-            context.s_mul_i32(Sgpr(sgprs.lds_start_addr), Sgpr(sgprs.lds_start_addr), -1)
+            context.s_mul_i32(
+                Sgpr(sgprs.lds_start_addr), Sgpr(sgprs.lds_start_addr), -1
+            )
 
             for j, col in enumerate(vgprs.lw_addr_a):
                 for i, row in enumerate(col):
@@ -1676,18 +1787,23 @@ def gemm(
             for u in range(config.num_unrolled_iters):
                 context.s_waitcnt(lgkmcnt=0)
                 next_plr_buf_idx = (plr_buf_idx + 1) % (opt.plr + 1)
-                mfma_iter = mfma_gen(u%(opt.plr+1))
+                mfma_iter = mfma_gen(u % (opt.plr + 1))
                 if u + opt.plr < config.num_unrolled_iters:
-                    for inst in roundrobin(mfma_iter, lr_a_gen(plr_buf_idx), mfma_iter, lr_b_gen(plr_buf_idx)):
+                    for inst in roundrobin(
+                        mfma_iter,
+                        lr_a_gen(plr_buf_idx),
+                        mfma_iter,
+                        lr_b_gen(plr_buf_idx),
+                    ):
                         if inst:
                             inst()
                 else:
-                    mfma(u%(opt.plr+1))
+                    mfma(u % (opt.plr + 1))
                 plr_buf_idx = next_plr_buf_idx
         elif opt.plr:
             for u in range(config.num_unrolled_iters):
                 context.s_waitcnt(lgkmcnt=0)
-                mfma(u%(opt.plr+1))
+                mfma(u % (opt.plr + 1))
                 next_plr_buf_idx = (plr_buf_idx + 1) % (opt.plr + 1)
                 if u + opt.plr < config.num_unrolled_iters:
                     lr_a(plr_buf_idx)
@@ -1698,7 +1814,7 @@ def gemm(
                 lr_a(plr_buf_idx)
                 lr_b(plr_buf_idx)
                 context.s_waitcnt(lgkmcnt=0)
-                mfma(u%(opt.plr+1))
+                mfma(u % (opt.plr + 1))
                 next_plr_buf_idx = (plr_buf_idx + 1) % (opt.plr + 1)
                 plr_buf_idx = next_plr_buf_idx
 
@@ -1714,9 +1830,17 @@ def gemm(
 
         with alloc_tmp_sgpr(1) as stmp:
             context.s_add_i32(Sgpr(sgprs.k_idx), Sgpr(sgprs.k_idx), config.depth_k)
-            context.s_mul_i32(stmp, Sgpr(sgprs.stride_a_1), config.depth_k * datatype_size(config.a_type))
+            context.s_mul_i32(
+                stmp,
+                Sgpr(sgprs.stride_a_1),
+                config.depth_k * datatype_size(config.a_type),
+            )
             context.s_add_i32(Sgpr(sgprs.gl_offset_a), Sgpr(sgprs.gl_offset_a), stmp)
-            context.s_add_i32(Sgpr(sgprs.gl_offset_b), Sgpr(sgprs.gl_offset_b), config.depth_k * datatype_size(config.a_type))
+            context.s_add_i32(
+                Sgpr(sgprs.gl_offset_b),
+                Sgpr(sgprs.gl_offset_b),
+                config.depth_k * datatype_size(config.a_type),
+            )
             context.s_add_i32(stmp, Sgpr(sgprs.k_idx), config.depth_k)
             context.s_cmp_lt_u32(stmp, Sgpr(sgprs.k))
             context.s_cbranch_scc1("outer_loop")
@@ -1737,17 +1861,22 @@ def gemm(
                 context.s_waitcnt(lgkmcnt=0)
                 next_plr_buf_idx = (plr_buf_idx + 1) % (opt.plr + 1)
                 if u + opt.plr < config.num_unrolled_iters:
-                    mfma_iter = mfma_gen(u%(opt.plr+1))
-                    for inst in roundrobin(mfma_iter, lr_a_gen(plr_buf_idx), mfma_iter, lr_b_gen(plr_buf_idx)):
+                    mfma_iter = mfma_gen(u % (opt.plr + 1))
+                    for inst in roundrobin(
+                        mfma_iter,
+                        lr_a_gen(plr_buf_idx),
+                        mfma_iter,
+                        lr_b_gen(plr_buf_idx),
+                    ):
                         if inst:
                             inst()
                 else:
-                    mfma(u%(opt.plr+1))
+                    mfma(u % (opt.plr + 1))
                 plr_buf_idx = next_plr_buf_idx
         elif opt.plr:
             for u in range(config.num_unrolled_iters):
                 context.s_waitcnt(lgkmcnt=0)
-                mfma(u%(opt.plr+1))
+                mfma(u % (opt.plr + 1))
                 next_plr_buf_idx = (plr_buf_idx + 1) % (opt.plr + 1)
                 if u + opt.plr < config.num_unrolled_iters:
                     lr_a(plr_buf_idx)
@@ -1758,69 +1887,142 @@ def gemm(
                 lr_a(plr_buf_idx)
                 lr_b(plr_buf_idx)
                 context.s_waitcnt(lgkmcnt=0)
-                mfma(u%(opt.plr+1))
+                mfma(u % (opt.plr + 1))
                 next_plr_buf_idx = (plr_buf_idx + 1) % (opt.plr + 1)
                 plr_buf_idx = next_plr_buf_idx
 
         context.comment("setup srd{c, d}")
-        context.s_mov_b64(SgprRange(sgprs.srd_c, 2), SgprRange(sgprs.kern_args+4, 2))
-        context.s_mov_b64(SgprRange(sgprs.srd_d, 2), SgprRange(sgprs.kern_args+6, 2))
-        context.s_mov_b32(Sgpr(sgprs.srd_c+3), 0x20000)
-        context.s_mov_b32(Sgpr(sgprs.srd_d+3), 0x20000)
-        context.s_mov_b32(Sgpr(sgprs.srd_c+2), Sgpr(sgprs.m))
-        context.s_mul_i32(Sgpr(sgprs.srd_c+2), Sgpr(sgprs.srd_c+2), Sgpr(sgprs.stride_c_1))
-        context.s_mul_i32(Sgpr(sgprs.srd_c+2), Sgpr(sgprs.srd_c+2), datatype_size(config.cd_type))
-        context.s_mov_b32(Sgpr(sgprs.srd_d+2), Sgpr(sgprs.m))
-        context.s_mul_i32(Sgpr(sgprs.srd_d+2), Sgpr(sgprs.srd_d+2), Sgpr(sgprs.stride_d_1))
-        context.s_mul_i32(Sgpr(sgprs.srd_d+2), Sgpr(sgprs.srd_d+2), datatype_size(config.cd_type))
-        #re-use
+        context.s_mov_b64(SgprRange(sgprs.srd_c, 2), SgprRange(sgprs.kern_args + 4, 2))
+        context.s_mov_b64(SgprRange(sgprs.srd_d, 2), SgprRange(sgprs.kern_args + 6, 2))
+        context.s_mov_b32(Sgpr(sgprs.srd_c + 3), 0x20000)
+        context.s_mov_b32(Sgpr(sgprs.srd_d + 3), 0x20000)
+        context.s_mov_b32(Sgpr(sgprs.srd_c + 2), Sgpr(sgprs.m))
+        context.s_mul_i32(
+            Sgpr(sgprs.srd_c + 2), Sgpr(sgprs.srd_c + 2), Sgpr(sgprs.stride_c_1)
+        )
+        context.s_mul_i32(
+            Sgpr(sgprs.srd_c + 2), Sgpr(sgprs.srd_c + 2), datatype_size(config.cd_type)
+        )
+        context.s_mov_b32(Sgpr(sgprs.srd_d + 2), Sgpr(sgprs.m))
+        context.s_mul_i32(
+            Sgpr(sgprs.srd_d + 2), Sgpr(sgprs.srd_d + 2), Sgpr(sgprs.stride_d_1)
+        )
+        context.s_mul_i32(
+            Sgpr(sgprs.srd_d + 2), Sgpr(sgprs.srd_d + 2), datatype_size(config.cd_type)
+        )
+        # re-use
         gl_offset_c = sgprs.gl_offset_a
         gw_offset_d = sgprs.gl_offset_b
-        context.s_mul_i32(Sgpr(gl_offset_c), Sgpr(sgprs.col_idx), Sgpr(sgprs.stride_c_1))
+        context.s_mul_i32(
+            Sgpr(gl_offset_c), Sgpr(sgprs.col_idx), Sgpr(sgprs.stride_c_1)
+        )
         context.s_add_i32(Sgpr(gl_offset_c), Sgpr(gl_offset_c), Sgpr(sgprs.row_idx))
-        context.s_mul_i32(Sgpr(gl_offset_c), Sgpr(gl_offset_c), datatype_size(config.cd_type))
-        context.s_mul_i32(Sgpr(gw_offset_d), Sgpr(sgprs.col_idx), Sgpr(sgprs.stride_d_1))
+        context.s_mul_i32(
+            Sgpr(gl_offset_c), Sgpr(gl_offset_c), datatype_size(config.cd_type)
+        )
+        context.s_mul_i32(
+            Sgpr(gw_offset_d), Sgpr(sgprs.col_idx), Sgpr(sgprs.stride_d_1)
+        )
         context.s_add_i32(Sgpr(gw_offset_d), Sgpr(gw_offset_d), Sgpr(sgprs.row_idx))
-        context.s_mul_i32(Sgpr(gw_offset_d), Sgpr(gw_offset_d), datatype_size(config.cd_type))
+        context.s_mul_i32(
+            Sgpr(gw_offset_d), Sgpr(gw_offset_d), datatype_size(config.cd_type)
+        )
 
         for j, col in enumerate(vgprs.gl_offset_d):
             for i, row in enumerate(col):
                 context.comment(f"gw_addr_{i}_{j}")
                 with alloc_tmp_sgpr(1) as stmp:
-                    context.v_and_b32(Vgpr(vgprs.t_col), config.mfma[1]-1, Vgpr(vgprs.wt_id))
-                    context.s_mov_b32(stmp,  j * config.wave_group[1] * config.mfma[1])
+                    context.v_and_b32(
+                        Vgpr(vgprs.t_col), config.mfma[1] - 1, Vgpr(vgprs.wt_id)
+                    )
+                    context.s_mov_b32(stmp, j * config.wave_group[1] * config.mfma[1])
                     context.v_add_u32(Vgpr(vgprs.t_col), Vgpr(vgprs.t_col), stmp)
-                    context.v_lshrrev_b32(Vgpr(vgprs.t_row), int(math.log2(config.mfma[1])), Vgpr(vgprs.wt_id))
+                    context.v_lshrrev_b32(
+                        Vgpr(vgprs.t_row),
+                        int(math.log2(config.mfma[1])),
+                        Vgpr(vgprs.wt_id),
+                    )
                     context.v_mul_lo_u32(Vgpr(vgprs.t_row), 4, Vgpr(vgprs.t_row))
                     context.s_mov_b32(stmp, i * config.wave_group[0] * config.mfma[0])
                     context.v_add_u32(Vgpr(vgprs.t_row), Vgpr(vgprs.t_row), stmp)
-                    context.v_add_i32(Vgpr(vgprs.t_col), Vgpr(vgprs.t_col), Vgpr(vgprs.w_col))
-                    context.v_add_i32(Vgpr(vgprs.t_row), Vgpr(vgprs.t_row), Vgpr(vgprs.w_row))
+                    context.v_add_i32(
+                        Vgpr(vgprs.t_col), Vgpr(vgprs.t_col), Vgpr(vgprs.w_col)
+                    )
+                    context.v_add_i32(
+                        Vgpr(vgprs.t_row), Vgpr(vgprs.t_row), Vgpr(vgprs.w_row)
+                    )
                     context.comment(f"setup voffset_c_{i}_{j}")
-                    context.v_mul_lo_u32(Vgpr(vgprs.gl_offset_c[j][i]), Vgpr(vgprs.t_col), Sgpr(sgprs.stride_c_1))
-                    context.v_add_u32(Vgpr(vgprs.gl_offset_c[j][i]), Vgpr(vgprs.gl_offset_c[j][i]), Vgpr(vgprs.t_row))
-                    context.v_mul_lo_u32(Vgpr(vgprs.gl_offset_c[j][i]), Vgpr(vgprs.gl_offset_c[j][i]), datatype_size(config.cd_type))
+                    context.v_mul_lo_u32(
+                        Vgpr(vgprs.gl_offset_c[j][i]),
+                        Vgpr(vgprs.t_col),
+                        Sgpr(sgprs.stride_c_1),
+                    )
+                    context.v_add_u32(
+                        Vgpr(vgprs.gl_offset_c[j][i]),
+                        Vgpr(vgprs.gl_offset_c[j][i]),
+                        Vgpr(vgprs.t_row),
+                    )
+                    context.v_mul_lo_u32(
+                        Vgpr(vgprs.gl_offset_c[j][i]),
+                        Vgpr(vgprs.gl_offset_c[j][i]),
+                        datatype_size(config.cd_type),
+                    )
                     context.comment(f"setup voffset_d_{i}_{j}")
-                    context.v_mul_lo_u32(Vgpr(vgprs.gl_offset_d[j][i]), Vgpr(vgprs.t_col), Sgpr(sgprs.stride_d_1))
-                    context.v_add_u32(Vgpr(vgprs.gl_offset_d[j][i]), Vgpr(vgprs.gl_offset_d[j][i]), Vgpr(vgprs.t_row))
-                    context.v_mul_lo_u32(Vgpr(vgprs.gl_offset_d[j][i]), Vgpr(vgprs.gl_offset_d[j][i]), datatype_size(config.cd_type))
+                    context.v_mul_lo_u32(
+                        Vgpr(vgprs.gl_offset_d[j][i]),
+                        Vgpr(vgprs.t_col),
+                        Sgpr(sgprs.stride_d_1),
+                    )
+                    context.v_add_u32(
+                        Vgpr(vgprs.gl_offset_d[j][i]),
+                        Vgpr(vgprs.gl_offset_d[j][i]),
+                        Vgpr(vgprs.t_row),
+                    )
+                    context.v_mul_lo_u32(
+                        Vgpr(vgprs.gl_offset_d[j][i]),
+                        Vgpr(vgprs.gl_offset_d[j][i]),
+                        datatype_size(config.cd_type),
+                    )
 
-        context.s_mov_b32(Sgpr(sgprs.alpha), Sgpr(sgprs.kern_args+15))
-        context.s_mov_b32(Sgpr(sgprs.beta), Sgpr(sgprs.kern_args+16))
+        context.s_mov_b32(Sgpr(sgprs.alpha), Sgpr(sgprs.kern_args + 15))
+        context.s_mov_b32(Sgpr(sgprs.beta), Sgpr(sgprs.kern_args + 16))
 
         context.label("gw")
         for j, col in enumerate(agprs.arpgs):
             for i, row in enumerate(col):
                 context.comment(f"gw_{i}_{j}")
                 for r in range(agprs.num_reg_per_thread):
-                    context.v_accvgpr_read_b32(Vgpr(vgprs.valu_acc[j][i]+r), AccVgpr(row+r))
-                context.buffer_load_inst(agprs.num_reg_per_thread)(VgprRange(vgprs.valu_c[j][i], agprs.num_reg_per_thread), Vgpr(vgprs.gl_offset_c[j][i]), SgprRange(sgprs.srd_c, 4), Sgpr(gl_offset_c), 0)
+                    context.v_accvgpr_read_b32(
+                        Vgpr(vgprs.valu_acc[j][i] + r), AccVgpr(row + r)
+                    )
+                context.buffer_load_inst(agprs.num_reg_per_thread)(
+                    VgprRange(vgprs.valu_c[j][i], agprs.num_reg_per_thread),
+                    Vgpr(vgprs.gl_offset_c[j][i]),
+                    SgprRange(sgprs.srd_c, 4),
+                    Sgpr(gl_offset_c),
+                    0,
+                )
                 for r in range(agprs.num_reg_per_thread):
-                    context.v_mul_f32(Vgpr(vgprs.valu_acc[j][i]+r), Vgpr(vgprs.valu_acc[j][i]+r), Sgpr(sgprs.alpha))
+                    context.v_mul_f32(
+                        Vgpr(vgprs.valu_acc[j][i] + r),
+                        Vgpr(vgprs.valu_acc[j][i] + r),
+                        Sgpr(sgprs.alpha),
+                    )
                 context.s_waitcnt(vmcnt=0)
                 for r in range(agprs.num_reg_per_thread):
-                    context.v_fma_f32(Vgpr(vgprs.valu_acc[j][i]+r), Sgpr(sgprs.beta), Vgpr(vgprs.valu_c[j][i]+r), Vgpr(vgprs.valu_acc[j][i]+r))
-                context.buffer_store_inst(agprs.num_reg_per_thread)(VgprRange(vgprs.valu_acc[j][i], agprs.num_reg_per_thread), Vgpr(vgprs.gl_offset_d[j][i]), SgprRange(sgprs.srd_d, 4), Sgpr(gw_offset_d), 0)
+                    context.v_fma_f32(
+                        Vgpr(vgprs.valu_acc[j][i] + r),
+                        Sgpr(sgprs.beta),
+                        Vgpr(vgprs.valu_c[j][i] + r),
+                        Vgpr(vgprs.valu_acc[j][i] + r),
+                    )
+                context.buffer_store_inst(agprs.num_reg_per_thread)(
+                    VgprRange(vgprs.valu_acc[j][i], agprs.num_reg_per_thread),
+                    Vgpr(vgprs.gl_offset_d[j][i]),
+                    SgprRange(sgprs.srd_d, 4),
+                    Sgpr(gw_offset_d),
+                    0,
+                )
 
         context.s_endpgm()
         return context.materialize()
@@ -1858,7 +2060,14 @@ gemm_config = GemmSolutionConfig(
 print(gemm_config.tile_size, gemm_config.num_workitems)
 print(gemm_config.num_bytes_per_buffer_load)
 
-arch = "gfx90a:xnack-"
+ap = argparse.ArgumentParser()
+ap.add_argument(dest="output_folder", action="store", type=str, help="Output folder")
+ap.add_argument("--arch", dest="arch", action="store", choices=["gfx90a", "gfx90a:xnack-", "gfx942"])
+args = ap.parse_args()
+
+arch = args.arch
+output_folder = args.output_folder
+
 opt = GemmOptimizations(1)
 opt.plr = 1
 asm_str = gemm(
@@ -1886,7 +2095,7 @@ asm_str = gemm(
     ],
 )
 
-with open('generated_gemm.s', 'w') as f:
+with open(f"{output_folder}/generated_gemm.s", "w") as f:
     f.write(asm_str)
     f.flush()
     ret = subprocess.run(
@@ -1907,7 +2116,14 @@ with open('generated_gemm.s', 'w') as f:
         ]
     )
     ret = subprocess.run(
-        [DEFAULT_CLANG_PATH, "-target", "amdgcn-amd-amdhsa", "generated_gemm.o", "-o", "generated_gemm.co"]
+        [
+            DEFAULT_CLANG_PATH,
+            "-target",
+            "amdgcn-amd-amdhsa",
+            "generated_gemm.o",
+            "-o",
+            f"{output_folder}/generated_gemm.co",
+        ]
     )
 
 with open("generated_gemm.toml", "wb") as f:
