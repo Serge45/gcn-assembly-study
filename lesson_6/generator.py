@@ -883,20 +883,27 @@ class GemmSolutionConfig:
 
     @property
     def lds_offset_bytes(self) -> Tuple[int, int]:
-        return 0, self.tile_size[0] * self.depth_k * datatype_size(self.a_type)
+        return 0, (
+            self.tile_size[0] + self.lds_pad_bytes[0]
+        ) * self.depth_k * datatype_size(self.a_type)
 
     @property
     def lds_swap_offset_bytes(self) -> int:
-        return self.tile_size[0] * self.depth_k * datatype_size(
-            self.a_type
-        ) + self.tile_size[1] * self.depth_k * datatype_size(self.b_type)
+        return (
+            self.tile_size[0] + self.lds_pad_bytes[0]
+        ) * self.depth_k * datatype_size(self.a_type) + self.tile_size[1] * (
+            self.depth_k + self.lds_pad_bytes[1]
+        ) * datatype_size(
+            self.b_type
+        )
 
     @property
     def lds_usage_bytes(self) -> int:
-        return 2 * (
-            self.tile_size[0] * self.depth_k * datatype_size(self.a_type)
-            + self.tile_size[1] * self.depth_k * datatype_size(self.b_type)
-        )
+        return 2 * self.lds_swap_offset_bytes
+
+    @property
+    def lds_pad_bytes(self) -> Tuple[int, int]:
+        return 0, self._auto_lds_pad_b() * datatype_size(self.b_type)
 
     @property
     def num_unrolled_iters(self) -> int:
@@ -915,6 +922,7 @@ class GemmSolutionConfig:
             "wave_tiling": self.wave_tiling,
             "depth_k": self.depth_k,
             "wavefront_size": self.wavefront_size,
+            "lds_usage_bytes": self.lds_usage_bytes,
             "name": self.name if self.name else "",
         }
 
@@ -930,9 +938,20 @@ class GemmSolutionConfig:
         self.wave_tiling = d["wave_tiling"]
         self.depth_k = d["depth_k"]
         self.wavefront_size = d["wavefront_size"]
+        self.lds_usage_bytes = d["lds_usage_bytes"]
         self.name = d["name"]
 
+    def _auto_lds_pad_b(self) -> int:
+        ret = 0
+        best_banks = 0
+        for pad in [0, 1, 2, 4, 8, 16]:
+            addr = [((i//self.mfma[1])+(i%self.mfma[1])*(self.depth_k+pad))*datatype_size(self.b_type) for i in range(self.wavefront_size//2)]
+            banks = set((i//4)%32 for i in addr)
+            if len(banks) >= best_banks:
+                ret = pad
+                best_banks = len(banks)
 
+        return ret
 @gpu_function
 def gemm(
     context: GpuContext,
@@ -1530,7 +1549,11 @@ def gemm(
                     context.comment(f"lw_addr_a_{i}_{j}")
                     context.s_mov_b32(stmp, j * num_load_threads1_a)
                     context.v_add_u32(Vgpr(row), Vgpr(vgprs.t_col), stmp)
-                    context.s_mov_b32(stmp, config.tile_size[0])
+                    context.s_mov_b32(
+                        stmp,
+                        config.tile_size[0]
+                        + config.lds_pad_bytes[0] // datatype_size(config.a_type),
+                    )
                     context.v_mul_lo_u32(Vgpr(row), Vgpr(row), stmp)
                     context.s_mov_b32(stmp, i * num_load_threads0_a * gl_num_elements_a)
                     context.v_add_u32(Vgpr(row), Vgpr(row), stmp)
@@ -1552,7 +1575,11 @@ def gemm(
                     context.comment(f"lw_addr_b_{i}_{j}")
                     context.s_mov_b32(stmp, j * num_load_threads1_b)
                     context.v_add_u32(Vgpr(row), Vgpr(vgprs.t_col), stmp)
-                    context.s_mov_b32(stmp, config.depth_k)
+                    context.s_mov_b32(
+                        stmp,
+                        config.depth_k
+                        + config.lds_pad_bytes[1] // datatype_size(config.b_type),
+                    )
                     context.v_mul_lo_u32(Vgpr(row), Vgpr(row), stmp)
                     context.s_mov_b32(stmp, i * num_load_threads0_b * gl_num_elements_b)
                     context.v_add_u32(Vgpr(row), Vgpr(row), stmp)
@@ -1625,7 +1652,11 @@ def gemm(
         for j, col in enumerate(vgprs.lr_addr_a):
             for i, row in enumerate(col):
                 with alloc_tmp_sgpr(1) as stmp:
-                    context.s_mov_b32(stmp, config.tile_size[0])
+                    context.s_mov_b32(
+                        stmp,
+                        config.tile_size[0]
+                        + config.lds_pad_bytes[0] // datatype_size(config.a_type),
+                    )
                     context.v_mul_lo_u32(Vgpr(row), Vgpr(vgprs.t_col), stmp)
                     context.v_add_u32(Vgpr(row), Vgpr(row), Vgpr(vgprs.t_row))
                     context.v_mul_lo_u32(
@@ -1645,7 +1676,11 @@ def gemm(
         for j, col in enumerate(vgprs.lr_addr_b):
             for i, row in enumerate(col):
                 with alloc_tmp_sgpr(1) as stmp:
-                    context.s_mov_b32(stmp, config.depth_k)
+                    context.s_mov_b32(
+                        stmp,
+                        config.depth_k
+                        + config.lds_pad_bytes[1] // datatype_size(config.b_type),
+                    )
                     context.v_mul_lo_u32(Vgpr(row), Vgpr(vgprs.t_col), stmp)
                     context.v_add_u32(Vgpr(row), Vgpr(row), Vgpr(vgprs.t_row))
                     context.v_mul_lo_u32(
@@ -2101,7 +2136,7 @@ gemm_config = GemmSolutionConfig(
     DataType.FP32,
     (16, 16, 1, 4),
     (2, 2),
-    (2, 2),
+    (4, 2),
     16,
     False,
     False,
