@@ -7,6 +7,13 @@ import subprocess
 import tomli_w
 from dataclasses import dataclass
 import math
+from itertools import cycle, islice
+
+def roundrobin(*iterables):
+    iterators = map(iter, iterables)
+    for num_active in range(len(iterables), 0, -1):
+        iterators = cycle(islice(iterators, num_active))
+        yield from map(next, iterators)
 
 DEFAULT_CLANG_PATH = "/opt/rocm/llvm/bin/clang++"
 MAX_LDS_NUM_BYTES = 65536
@@ -799,6 +806,8 @@ class GemmSolutionConfig:
         if self.lds_usage_bytes >= MAX_LDS_NUM_BYTES:
             raise RuntimeError(f"LDS usage exceeds {MAX_LDS_NUM_BYTES}: {self.lds_usage_bytes}")
 
+        assert all((wave_group[i] & (wave_group[i] - 1)) == 0 for i in range(len(wave_group)))
+
     @property
     def tile_size(self) -> Tuple[int, int]:
         return (
@@ -1346,14 +1355,6 @@ def gemm(
                         datatype_size(config.a_type),
                         Vgpr(vgprs.gl_offset_a[j][i]),
                     )
-                    # context.v_add_u32(
-                    #     Vgpr(vgprs.t_row),
-                    #     num_load_threads0_a * gl_num_elements_a,
-                    #     Vgpr(vgprs.t_row),
-                    # )
-                    # context.v_add_u32(
-                    #     Vgpr(vgprs.t_col), num_load_threads1_a, Vgpr(vgprs.t_col)
-                    # )
 
         gl_num_elements_b = config.num_bytes_per_buffer_load[1] // datatype_size(
             config.b_type
@@ -1391,14 +1392,6 @@ def gemm(
                         Vgpr(vgprs.gl_offset_b[j][i]),
                         datatype_size(config.b_type),
                     )
-                    # context.v_add_u32(
-                    #     Vgpr(vgprs.t_row),
-                    #     num_load_threads0_b * gl_num_elements_b,
-                    #     Vgpr(vgprs.t_row),
-                    # )
-                    # context.v_add_u32(
-                    #     Vgpr(vgprs.t_col), num_load_threads1_b, Vgpr(vgprs.t_col)
-                    # )
 
         def gl_a():
             context.comment("gl_a")
@@ -1584,11 +1577,6 @@ def gemm(
         context.s_waitcnt(lgkmcnt=0)
         context.s_barrier()
 
-        context.label("outer_loop")
-
-        gl_a()
-        gl_b()
-
         unrolled_lr_offset_a, unrolled_lr_offset_b = config.lds_offset_bytes
 
         def lr_a(k: int):
@@ -1605,10 +1593,41 @@ def gemm(
                     context.ds_read_inst(config.num_bytes_per_ds_read[1])(Vgpr(row), Vgpr(vgprs.lr_addr_b[j][i]), unrolled_lr_offset_b)
             unrolled_lr_offset_b += config.mfma[3] * datatype_size(config.b_type)
 
+        context.label("outer_loop")
+
+        plr_buf_idx = 0
+
+        for u in range(opt.plr):
+            lr_a(plr_buf_idx)
+            lr_b(plr_buf_idx)
+            plr_buf_idx = (plr_buf_idx + 1) % (opt.plr + 1)
+
+        gl_a()
+        gl_b()
+
         def mfma(k: int):
             for j, col in enumerate(agprs.arpgs):
                 for i, row in enumerate(col):
                     context.mfma_inst(config.mfma)(AccVgprRange(row, 4), Vgpr(vgprs.valu_a[k][0][i]), Vgpr(vgprs.valu_b[k][j][0]), AccVgprRange(row, 4))
+
+        def lr_a_gen(k: int):
+            nonlocal unrolled_lr_offset_a
+            for j, col in enumerate(vgprs.valu_a[k]):
+                for i, row in enumerate(col):
+                    yield lambda: context.ds_read_inst(config.num_bytes_per_ds_read[0])(Vgpr(row), Vgpr(vgprs.lr_addr_a[j][i]), unrolled_lr_offset_a)
+            unrolled_lr_offset_a += config.mfma[3] * config.tile_size[0] * datatype_size(config.a_type)
+
+        def lr_b_gen(k: int):
+            nonlocal unrolled_lr_offset_b
+            for j, col in enumerate(vgprs.valu_b[k]):
+                for i, row in enumerate(col):
+                    yield context.ds_read_inst(config.num_bytes_per_ds_read[1])(Vgpr(row), Vgpr(vgprs.lr_addr_b[j][i]), unrolled_lr_offset_b)
+            unrolled_lr_offset_b += config.mfma[3] * datatype_size(config.b_type)
+
+        def mfma_gen(k):
+            for j, col in enumerate(agprs.arpgs):
+                for i, row in enumerate(col):
+                    yield lambda: context.mfma_inst(config.mfma)(AccVgprRange(row, 4), Vgpr(vgprs.valu_a[k][0][i]), Vgpr(vgprs.valu_b[k][j][0]), AccVgprRange(row, 4))
 
         def lw_a():
             for j, col in enumerate(vgprs.lw_addr_a):
@@ -1653,21 +1672,35 @@ def gemm(
                 for i, row in enumerate(col):
                     context.v_add_i32(Vgpr(row), Vgpr(row), Sgpr(sgprs.lds_start_addr))
 
-        plr_buf_idx = 0
-
-        for u in range(opt.plr):
-            lr_a(plr_buf_idx)
-            lr_b(plr_buf_idx)
-            plr_buf_idx = (plr_buf_idx + 1) % (opt.plr + 1)
-
-        for u in range(config.num_unrolled_iters):
-            context.s_waitcnt(lgkmcnt=0)
-            next_plr_buf_idx = (plr_buf_idx + 1) % (opt.plr + 1)
-            if u + opt.plr < config.num_unrolled_iters:
+        if opt.level:
+            for u in range(config.num_unrolled_iters):
+                context.s_waitcnt(lgkmcnt=0)
+                next_plr_buf_idx = (plr_buf_idx + 1) % (opt.plr + 1)
+                mfma_iter = mfma_gen(u%(opt.plr+1))
+                if u + opt.plr < config.num_unrolled_iters:
+                    for inst in roundrobin(mfma_iter, lr_a_gen(plr_buf_idx), mfma_iter, lr_b_gen(plr_buf_idx)):
+                        if inst:
+                            inst()
+                else:
+                    mfma(u%(opt.plr+1))
+                plr_buf_idx = next_plr_buf_idx
+        elif opt.plr:
+            for u in range(config.num_unrolled_iters):
+                context.s_waitcnt(lgkmcnt=0)
+                mfma(u%(opt.plr+1))
+                next_plr_buf_idx = (plr_buf_idx + 1) % (opt.plr + 1)
+                if u + opt.plr < config.num_unrolled_iters:
+                    lr_a(plr_buf_idx)
+                    lr_b(plr_buf_idx)
+                plr_buf_idx = next_plr_buf_idx
+        else:
+            for u in range(config.num_unrolled_iters):
                 lr_a(plr_buf_idx)
                 lr_b(plr_buf_idx)
-            mfma(u%(opt.plr+1))
-            plr_buf_idx = next_plr_buf_idx
+                context.s_waitcnt(lgkmcnt=0)
+                mfma(u%(opt.plr+1))
+                next_plr_buf_idx = (plr_buf_idx + 1) % (opt.plr + 1)
+                plr_buf_idx = next_plr_buf_idx
 
         context.comment("ds write")
         context.s_waitcnt(vmcnt=0)
@@ -1699,14 +1732,35 @@ def gemm(
             lr_b(plr_buf_idx)
             plr_buf_idx = (plr_buf_idx + 1) % (opt.plr + 1)
 
-        for u in range(config.num_unrolled_iters):
-            context.s_waitcnt(lgkmcnt=0)
-            next_plr_buf_idx = (plr_buf_idx + 1) % (opt.plr + 1)
-            if u + opt.plr < config.num_unrolled_iters:
+        if opt.level:
+            for u in range(config.num_unrolled_iters):
+                context.s_waitcnt(lgkmcnt=0)
+                next_plr_buf_idx = (plr_buf_idx + 1) % (opt.plr + 1)
+                if u + opt.plr < config.num_unrolled_iters:
+                    mfma_iter = mfma_gen(u%(opt.plr+1))
+                    for inst in roundrobin(mfma_iter, lr_a_gen(plr_buf_idx), mfma_iter, lr_b_gen(plr_buf_idx)):
+                        if inst:
+                            inst()
+                else:
+                    mfma(u%(opt.plr+1))
+                plr_buf_idx = next_plr_buf_idx
+        elif opt.plr:
+            for u in range(config.num_unrolled_iters):
+                context.s_waitcnt(lgkmcnt=0)
+                mfma(u%(opt.plr+1))
+                next_plr_buf_idx = (plr_buf_idx + 1) % (opt.plr + 1)
+                if u + opt.plr < config.num_unrolled_iters:
+                    lr_a(plr_buf_idx)
+                    lr_b(plr_buf_idx)
+                plr_buf_idx = next_plr_buf_idx
+        else:
+            for u in range(config.num_unrolled_iters):
                 lr_a(plr_buf_idx)
                 lr_b(plr_buf_idx)
-            mfma(u%(opt.plr+1))
-            plr_buf_idx = next_plr_buf_idx
+                context.s_waitcnt(lgkmcnt=0)
+                mfma(u%(opt.plr+1))
+                next_plr_buf_idx = (plr_buf_idx + 1) % (opt.plr + 1)
+                plr_buf_idx = next_plr_buf_idx
 
         context.comment("setup srd{c, d}")
         context.s_mov_b64(SgprRange(sgprs.srd_c, 2), SgprRange(sgprs.kern_args+4, 2))
