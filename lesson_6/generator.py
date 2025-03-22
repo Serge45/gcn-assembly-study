@@ -1,3 +1,4 @@
+from __future__ import annotations
 from typing import Optional, List, Tuple, Dict
 from contextlib import contextmanager
 from io import StringIO
@@ -34,6 +35,7 @@ class Gpr:
 
 class GprRange:
     gpr_type: str = None
+    underlying_gpr_type = Gpr
 
     def __init__(self, index: int, size: int):
         self.index = index
@@ -42,25 +44,11 @@ class GprRange:
     def __str__(self):
         return f"{self.gpr_type}[{self.index}:{self.index+self.size-1}]"
 
-    def split(self) -> List[Gpr]:
-        if isinstance(self, VgprRange):
-            return [Vgpr(self.index + i) for i in range(self.size)]
-        elif isinstance(self, SgprRange):
-            return [Sgpr(self.index + i) for i in range(self.size)]
-        elif isinstance(self, AccVgprRange):
-            return [AccVgpr(self.index + i) for i in range(self.size)]
-
-
-class VgprRange(GprRange):
-    gpr_type: str = "v"
-
-
-class SgprRange(GprRange):
-    gpr_type: str = "s"
-
-
-class AccVgprRange(GprRange):
-    gpr_type: str = "acc"
+    def split(self, num_comp: int=1) -> List[Gpr]:
+        if num_comp > 1:
+            return [type(self)(self.index + i, num_comp) for i in range(self.size)]
+        else:
+            return [GprRange.underlying_gpr_type(self.index + i) for i in range(self.size)]
 
 
 class Vgpr(Gpr):
@@ -73,6 +61,19 @@ class Sgpr(Gpr):
 
 class AccVgpr(Gpr):
     gpr_type: str = "acc"
+
+class VgprRange(GprRange):
+    gpr_type: str = "v"
+    underlying_gpr_type = Vgpr
+
+class SgprRange(GprRange):
+    gpr_type: str = "s"
+    underlying_gpr_type = Sgpr
+
+
+class AccVgprRange(GprRange):
+    gpr_type: str = "acc"
+    underlying_gpr_type = AccVgpr
 
 
 class GprPool:
@@ -762,9 +763,25 @@ class GpuContext:
             ]
         )
 
+    @count_gprs
+    def v_mfma_f32_32x32x2f32(
+        self, acc: AccVgprRange, a: Vgpr, b: Vgpr, c: AccVgprRange
+    ):
+        self.instructions.append(
+            [
+                lambda: f"v_mfma_f32_32x32x2f32 {str(acc)}, {str(a)}, {str(b)}, {str(c)}",
+                acc,
+                a,
+                b,
+                c,
+            ]
+        )
+
     def mfma_inst(self, mfma: Tuple[int, int, int, int]):
         if mfma == (16, 16, 1, 4):
             return self.v_mfma_f32_16x16x4f32
+        elif mfma == (32, 32, 1, 2):
+            return self.v_mfma_f32_32x32x2f32
         assert False
 
     def materialize(self):
@@ -835,9 +852,12 @@ class GemmSolutionConfig:
                 f"LDS usage exceeds {MAX_LDS_NUM_BYTES}: {self.lds_usage_bytes}"
             )
 
-        assert all(
+        if not all(
             (wave_group[i] & (wave_group[i] - 1)) == 0 for i in range(len(wave_group))
-        )
+        ):
+            raise RuntimeError(
+                f"Invalid wave group: {wave_group}"
+            )
 
     @property
     def tile_size(self) -> Tuple[int, int]:
@@ -1026,6 +1046,7 @@ def gemm(
     @dataclass
     class AgprAlloc:
         num_reg_per_thread: int
+        num_reg_contiguous: int
         arpgs: List[List[List[int]]]
 
     def sgpr_alloc():
@@ -1208,12 +1229,12 @@ def gemm(
         )
 
     def agpr_alloc():
-        agprs = AgprAlloc(4, [])
+        agprs = AgprAlloc(config.mfma[0]*config.mfma[1]//config.wavefront_size, 4, [])
 
         for j in range(config.wave_tiling[1]):
             val = []
             for i in range(config.wave_tiling[0]):
-                val.append(4 * (i + j * config.wave_tiling[0]))
+                val.append(agprs.num_reg_per_thread * (i + j * config.wave_tiling[0]))
             agprs.arpgs.append(val)
 
         return agprs
@@ -1731,10 +1752,10 @@ def gemm(
             for j, col in enumerate(agprs.arpgs):
                 for i, row in enumerate(col):
                     context.mfma_inst(config.mfma)(
-                        AccVgprRange(row, 4),
+                        AccVgprRange(row, agprs.num_reg_per_thread),
                         Vgpr(vgprs.valu_a[k][0][i]),
                         Vgpr(vgprs.valu_b[k][j][0]),
-                        AccVgprRange(row, 4),
+                        AccVgprRange(row, agprs.num_reg_per_thread),
                     )
 
         def lr_a_gen(k: int):
@@ -1761,10 +1782,10 @@ def gemm(
             for j, col in enumerate(agprs.arpgs):
                 for i, row in enumerate(col):
                     yield lambda: context.mfma_inst(config.mfma)(
-                        AccVgprRange(row, 4),
+                        AccVgprRange(row, agprs.num_reg_per_thread),
                         Vgpr(vgprs.valu_a[k][0][i]),
                         Vgpr(vgprs.valu_b[k][j][0]),
-                        AccVgprRange(row, 4),
+                        AccVgprRange(row, agprs.num_reg_per_thread),
                     )
 
         def lw_a():
@@ -2079,13 +2100,22 @@ def gemm(
                     context.v_accvgpr_read_b32(
                         Vgpr(vgprs.valu_acc[j][i] + r), AccVgpr(row + r)
                     )
-                context.buffer_load_inst(agprs.num_reg_per_thread)(
-                    VgprRange(vgprs.valu_c[j][i], agprs.num_reg_per_thread),
-                    Vgpr(vgprs.gl_offset_c[j][i]),
-                    SgprRange(sgprs.srd_c, 4),
-                    Sgpr(gl_offset_c),
-                    0,
-                )
+                
+                for l in range(0, agprs.num_reg_per_thread, agprs.num_reg_contiguous):
+                    context.buffer_load_inst(agprs.num_reg_contiguous)(
+                        VgprRange(vgprs.valu_c[j][i]+l, agprs.num_reg_contiguous),
+                        Vgpr(vgprs.gl_offset_c[j][i]),
+                        SgprRange(sgprs.srd_c, 4),
+                        Sgpr(gl_offset_c),
+                        0,
+                    )
+
+                    if agprs.num_reg_per_thread // agprs.num_reg_contiguous > 1:
+                        with alloc_tmp_sgpr(1) as stmp:
+                            increments = config.wavefront_size//config.mfma[1]*agprs.num_reg_contiguous
+                            context.s_mul_i32(stmp, Sgpr(sgprs.stride_c_0), increments)
+                            context.s_mul_i32(stmp, stmp, datatype_size(config.cd_type))
+                            context.v_add_u32(Vgpr(vgprs.gl_offset_c[j][i]), Vgpr(vgprs.gl_offset_c[j][i]), stmp)
                 for r in range(agprs.num_reg_per_thread):
                     context.v_mul_f32(
                         Vgpr(vgprs.valu_acc[j][i] + r),
@@ -2100,13 +2130,22 @@ def gemm(
                         Vgpr(vgprs.valu_c[j][i] + r),
                         Vgpr(vgprs.valu_acc[j][i] + r),
                     )
-                context.buffer_store_inst(agprs.num_reg_per_thread)(
-                    VgprRange(vgprs.valu_acc[j][i], agprs.num_reg_per_thread),
-                    Vgpr(vgprs.gl_offset_d[j][i]),
-                    SgprRange(sgprs.srd_d, 4),
-                    Sgpr(gw_offset_d),
-                    0,
-                )
+
+                for l in range(0, agprs.num_reg_per_thread, agprs.num_reg_contiguous):
+                    context.buffer_store_inst(agprs.num_reg_contiguous)(
+                        VgprRange(vgprs.valu_acc[j][i]+l, agprs.num_reg_contiguous),
+                        Vgpr(vgprs.gl_offset_d[j][i]),
+                        SgprRange(sgprs.srd_d, 4),
+                        Sgpr(gw_offset_d),
+                        0,
+                    )
+
+                    if agprs.num_reg_per_thread // agprs.num_reg_contiguous > 1:
+                        with alloc_tmp_sgpr(1) as stmp:
+                            increments = config.wavefront_size//config.mfma[1]*agprs.num_reg_contiguous
+                            context.s_mul_i32(stmp, Sgpr(sgprs.stride_d_0), increments)
+                            context.s_mul_i32(stmp, stmp, datatype_size(config.cd_type))
+                            context.v_add_u32(Vgpr(vgprs.gl_offset_d[j][i]), Vgpr(vgprs.gl_offset_d[j][i]), stmp)
 
         context.s_endpgm()
         return context.materialize()
@@ -2134,7 +2173,8 @@ gemm_config = GemmSolutionConfig(
     DataType.FP32,
     DataType.FP32,
     DataType.FP32,
-    (16, 16, 1, 4),
+    # (16, 16, 1, 4),
+    (32, 32, 1, 2),
     (2, 2),
     (4, 2),
     16,
